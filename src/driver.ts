@@ -21,7 +21,6 @@ import type { TFdProvidersConfig } from './config.js';
 import { resolveProvider } from './config.js';
 import { runRole } from './agent.js';
 import type { TFdMcpClient, TFdMcpTool } from './mcp.js';
-import { checkSql } from './sqlguard.js';
 
 export interface TFdRunOptions {
   taskDir: string;
@@ -284,13 +283,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, nextL1Number(content, step.section ?? 'ISSUE'));
     const tools = roleTools(opts.spec, role, opts.mcp);
     const callTool = opts.mcp !== undefined
-      ? async (n: string, a: Record<string, unknown>) => {
-          if (n === 'execute_sql' && typeof a.sql === 'string') {
-            const g = checkSql(a.sql);
-            if (!g.ok) throw new Error(`SQL-guard: ${g.reason}`);
-          }
-          return opts.mcp!.call(n, a);
-        }
+      ? async (n: string, a: Record<string, unknown>) => opts.mcp!.call(n, a)
       : undefined;
 
     // Пре-проверка плана кодера (OBJECT в issue-app.md): create ⇒ объекта ещё нет,

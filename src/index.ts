@@ -6,7 +6,5 @@ export { runRole } from './agent.js';
 export type { TFdRunRoleOpts } from './agent.js';
 export { startMcp } from './mcp.js';
 export type { TFdMcpClient, TFdMcpTool } from './mcp.js';
-export { checkSql } from './sqlguard.js';
-export type { TSqlGuardResult } from './sqlguard.js';
 export { run } from './driver.js';
 export type { TFdRunOptions, TFdRunResult } from './driver.js';

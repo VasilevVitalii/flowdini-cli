@@ -65,21 +65,11 @@ AI-шаг до первого `HUMAN.*` или DONE.
 Лог вызовов MCP не ведём (решение владельца, 2026-11-22): аудит — журнал таска
 + снапшоты.
 
-## SQL-guard
-
-Перед каждым `execute_sql` SQL проверяется (`checkSql`): разрешён только один
-statement из `CREATE`/`ALTER`/`DROP PROCEDURE|FUNCTION|VIEW`. DDL таблиц
-(`DROP/ALTER TABLE`, `TRUNCATE`) и несколько statements за один вызов
-блокируются. Ограничение v1: `;` внутри тела процедуры трактуется как второй
-statement — пишите процедуру одним statement без `;` внутри (в T-SQL это
-допустимо).
-
 ## Модули
 
 - `config.ts` — конфиг провайдеров + `model → провайдер`.
 - `llm.ts` — OpenAI-совместимый клиент (`chat/completions`, fetch).
 - `agent.ts` — tool-calling цикл роли.
 - `mcp.ts` — MCP-клиент к `vv-db-mcp` (stdio).
-- `sqlguard.ts` — allowlist для `execute_sql`.
 - `driver.ts` — цикл исполнения.
 - `cli.ts` — точка входа.
