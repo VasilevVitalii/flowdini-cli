@@ -37,6 +37,7 @@ export interface TFdRunResult {
   steps: number;
   stoppedFor: string | null;
   errors: string[];
+  hitMaxSteps: boolean;
 }
 
 const CHAT_FILE = 'chat.md';
@@ -166,6 +167,8 @@ function buildUserPrompt(
       lines.push('Обязательно добавь в свойства [fd-to:: AI.REVIEWER] — результат идёт на ревью.');
     } else if (section === 'ANSWERS') {
       lines.push('Обязательно добавь в свойства [fd-to:: AI.ANALYST].');
+    } else if (section === 'REVIEW') {
+      lines.push('Если нашёл замечания — под каждое вложенный «## BUG N» (только новые, не повторяй уже закрытые) со свойствами [fd-from:: AI.REVIEWER] [fd-to:: AI.CODER.SENIOR]. Если замечаний нет — НЕ добавляй fd-to: дальше решает человек (DONE или новый ISSUE).');
     }
   } else {
     lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше; укажи fd-reply на дугу).');
@@ -235,7 +238,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const vaultRoot = opts.vaultRoot ?? opts.taskDir;
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
-  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [] };
+  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false };
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
@@ -313,6 +316,9 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
         await captureSnapshot(opts.taskDir, iteration, defs);
       }
     }
+  }
+  if (result.errors.length === 0 && result.stoppedFor === null && result.steps >= maxSteps && nextStep(content) !== null) {
+    result.hitMaxSteps = true;
   }
   return result;
 }

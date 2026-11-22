@@ -81,6 +81,8 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     } else if (res.stoppedFor !== null) {
       console.log(`остановка: ждём «${res.stoppedFor}»`);
+    } else if (res.hitMaxSteps) {
+      console.log(`достигнут лимит шагов (${res.steps}) — есть открытые дуги; запусти снова`);
     } else {
       console.log('открытых AI-дуг нет (DONE или затор)');
     }
