@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // CLI автономного рантайма flowdini: `flowdini run <taskDir> [flags]`.
-import { readSpec } from 'flowdini-engine';
+import { readSpec, validateSpec } from 'flowdini-engine';
 import { loadProvidersConfig } from './config.js';
 import { startMcp } from './mcp.js';
 import { run } from './driver.js';
@@ -53,6 +53,12 @@ async function main(): Promise<void> {
   const providersPath = f['--providers'] ?? 'fd.providers.yaml';
 
   const spec = await readSpec(specPath);
+  const specErrors = validateSpec(spec);
+  if (specErrors.length > 0) {
+    process.stderr.write('ошибки SPEC-конфига:\n');
+    for (const e of specErrors) process.stderr.write(`  - ${e.path}: ${e.error}\n`);
+    process.exit(1);
+  }
   const providers = loadProvidersConfig(providersPath);
 
   const vvdbDir = f['--vvdb'];

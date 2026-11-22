@@ -1,5 +1,5 @@
 // Драйвер цикла исполнения: nextStep → roleBrief → агент-роль (LLM + MCP) → раздел → taskCheck → снапшот.
-import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, rename } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { textToStructure } from 'flowdini-spec';
 import type { TFdContent } from 'flowdini-spec';
@@ -178,6 +178,11 @@ function buildUserPrompt(
   return lines.join('\n');
 }
 
+function isNotFoundError(e: unknown): boolean {
+  const msg = String((e as Error)?.message ?? e);
+  return /not_found|не найден|not found|does not exist|doesn't exist/i.test(msg);
+}
+
 function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
     const parts = objPath.split('.');
@@ -195,8 +200,10 @@ function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
         if (parsed.ok === true && (parsed.definitions?.length ?? 0) > 0) {
           return { exists: true, kind };
         }
-      } catch {
-        // not_found → пробуем следующий objectType
+      } catch (e) {
+        // not_found → пробуем следующий objectType; сбой соединения/доступа НЕ скрываем.
+        if (isNotFoundError(e)) continue;
+        return { exists: null, kind: null };
       }
     }
     return { exists: false, kind: null };
@@ -220,8 +227,10 @@ function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinit
         if (parsed.ok === true && (parsed.definitions?.length ?? 0) > 0) {
           return parsed.definitions![0].definition ?? '';
         }
-      } catch {
-        // not_found → пробуем следующий objectType
+      } catch (e) {
+        // not_found → пробуем следующий objectType; сбой пробрасываем наружу.
+        if (isNotFoundError(e)) continue;
+        throw e;
       }
     }
     throw new Error(`definition not found: ${objPath}`);
@@ -265,11 +274,15 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
     if (step === null) break; // DONE или нет открытых дуг
-    const role = step.roles[0];
-    if (roleCovers('HUMAN', role)) {
-      result.stoppedFor = role;
+    const addressedRole = step.roles[0];
+    if (roleCovers('HUMAN', addressedRole)) {
+      result.stoppedFor = addressedRole;
       break;
     }
+    // Канон: код пишет JUNIOR, правки — SENIOR (INSTANCE наследует FUNC, если не задан в SPEC).
+    const role = step.section === 'CODE' ? 'AI.CODER.JUNIOR'
+      : step.section === 'FIX' ? 'AI.CODER.SENIOR'
+      : addressedRole;
     const brief = roleBrief(opts.spec, role, content);
     const model = brief.spec.model;
     if (model === undefined) {
@@ -285,8 +298,13 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, nextL1Number(content, step.section ?? 'ISSUE'));
     const tools = roleTools(opts.spec, role, opts.mcp);
+    const allowedTools = new Set((tools ?? []).map((t) => t.name));
     const callTool = opts.mcp !== undefined
       ? async (n: string, a: Record<string, unknown>) => {
+          // Защита: агент может вызвать только инструменты своей роли (SPEC tools).
+          if (!allowedTools.has(n)) {
+            throw new Error(`инструмент ${n} не разрешён роли ${role}`);
+          }
           if (opts.dryRun && n === 'execute_sql') {
             return JSON.stringify({ ok: true, skipped: true, note: 'dry-run: БД не изменялась' });
           }
@@ -322,7 +340,10 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     }
 
     journal = `${journal.trimEnd()}\n\n${sectionText.trim()}\n`;
-    await writeFile(chatPath, journal);
+    // Атомарная запись: tmp + rename — журнал никогда не остаётся полузаписанным.
+    const tmpPath = `${chatPath}.tmp`;
+    await writeFile(tmpPath, journal);
+    await rename(tmpPath, chatPath);
     content = textToStructure(journal, true);
     result.steps++;
 
