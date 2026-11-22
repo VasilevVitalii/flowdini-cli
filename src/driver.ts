@@ -1,6 +1,6 @@
 // Драйвер цикла исполнения: nextStep → roleBrief → агент-роль (LLM + MCP) → раздел → taskCheck → снапшот.
-import { readFile, writeFile, readdir, rename } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readFile, writeFile, readdir, rename, realpath } from 'node:fs/promises';
+import { join, resolve, sep } from 'node:path';
 import { textToStructure } from 'flowdini-spec';
 import type { TFdContent } from 'flowdini-spec';
 import {
@@ -60,28 +60,31 @@ async function readIfExists(path: string): Promise<string | null> {
   }
 }
 
-// Все OBJECT-объекты таска: они живут в issue-app.md/result-app.md, а НЕ в chat.md.
-// Драйвер снапшота читает их из всех .md таска, дедуп по obj-path.
-async function collectTaskObjects(taskDir: string): Promise<TFdDbObject[]> {
+// Все OBJECT-объекты таска: живут в issue-app.md/result-app.md, а НЕ в chat.md.
+// Рекурсивный обход taskDir (vault может быть вложен); дедуп по obj-path.
+export async function collectTaskObjects(taskDir: string): Promise<TFdDbObject[]> {
   const seen = new Set<string>();
   const objects: TFdDbObject[] = [];
-  let entries: string[] = [];
-  try {
-    entries = await readdir(taskDir);
-  } catch {
-    return objects;
-  }
-  for (const name of entries) {
-    if (!name.endsWith('.md')) continue;
-    const text = await readIfExists(join(taskDir, name));
-    if (text === null) continue;
-    for (const o of extractDbObjects(textToStructure(text, true))) {
-      if (!seen.has(o.objPath)) {
-        seen.add(o.objPath);
-        objects.push(o);
+  const targets = new Set(['issue-app.md', 'result-app.md']);
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(p);
+      } else if (targets.has(e.name)) {
+        const text = await readIfExists(p);
+        if (text === null) continue;
+        for (const o of extractDbObjects(textToStructure(text, true))) {
+          if (!seen.has(o.objPath)) {
+            seen.add(o.objPath);
+            objects.push(o);
+          }
+        }
       }
     }
   }
+  await walk(taskDir);
   return objects;
 }
 
@@ -111,9 +114,27 @@ async function buildSystemPrompt(
   lines.push('Твои оси (SPEC):');
   lines.push(specLines(spec));
   lines.push('');
-  const docFiles = [...context, ...vault];
-  for (const f of docFiles) {
+  // SPEC-биндинги (доверенный конфиг владельца) — читаем как есть.
+  for (const f of context) {
     const p = resolve(vaultRoot, f);
+    const text = await readIfExists(p);
+    if (text !== null) {
+      lines.push(`Контекст из «${f}»:`);
+      lines.push('```');
+      lines.push(text);
+      lines.push('```');
+      lines.push('');
+    }
+  }
+  // fd-vault (пользовательский ввод из ISSUE) — не выпускаем за vaultRoot (path traversal, симлинки).
+  const vaultReal = await realpath(vaultRoot).catch(() => null);
+  for (const f of vault) {
+    const p = resolve(vaultRoot, f);
+    if (vaultReal !== null) {
+      const rp = await realpath(p).catch(() => null);
+      if (rp === null) continue; // файла нет
+      if (rp !== vaultReal && !rp.startsWith(vaultReal + sep)) continue; // вне vault
+    }
     const text = await readIfExists(p);
     if (text !== null) {
       lines.push(`Контекст из «${f}»:`);
@@ -143,12 +164,14 @@ async function buildSystemPrompt(
       lines.push('Доступ к БД — только чтение (get_definition / describe_*). Не изменяй объекты БД.');
     } else if (Array.isArray(db)) {
       lines.push(`Тебе можно править только эти виды объектов БД: ${db.join(', ')}. DDL таблиц — не трогать.`);
+    } else if (typeof db === 'string') {
+      lines.push(`Тебе можно править только объекты БД вида «${db}». DDL таблиц — не трогать.`);
     }
   }
   return lines.join('\n');
 }
 
-function buildUserPrompt(
+export function buildUserPrompt(
   role: string,
   journal: string,
   section: string | null,
@@ -178,12 +201,12 @@ function buildUserPrompt(
   return lines.join('\n');
 }
 
-function isNotFoundError(e: unknown): boolean {
+export function isNotFoundError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e);
   return /not_found|не найден|not found|does not exist|doesn't exist/i.test(msg);
 }
 
-function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
+export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
     const parts = objPath.split('.');
     const name = parts[parts.length - 1];
@@ -210,7 +233,7 @@ function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   };
 }
 
-function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinition {
+export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinition {
   return async (objPath: string) => {
     const parts = objPath.split('.');
     const name = parts[parts.length - 1];
@@ -244,6 +267,32 @@ function roleTools(spec: TFdSpecConfig, role: string, mcp?: TFdMcpClient): TFdMc
   return mcp.tools.filter((t) => names.includes(t.name));
 }
 
+/** По завершении таска (DONE) собрать заметки-кандидаты в vault (человек мержит руками). */
+async function generateKnowledgeCandidates(
+  spec: TFdSpecConfig,
+  providers: TFdProvidersConfig,
+  taskDir: string,
+  journal: string,
+): Promise<void> {
+  const brief = roleBrief(spec, 'AI.ANALYST', textToStructure(journal, true));
+  const model = brief.spec.model;
+  if (model === undefined) return; // роль не настроена — пропускаем
+  const provider = resolveProvider(providers, model);
+  if (provider === null) return;
+  const system = [
+    'Ты — AI.ANALYST в методологии flowdini.',
+    'По журналу таска собери заметки-кандидаты для долгосрочной базы знаний (vault): факты, решения, тонкости домена и причины решений, которые стоит сохранить отдельно от кода.',
+    'Формат: каждая заметка — заголовок `## {тема}` и 1–4 строки текста. Без вступлений. Если сохранять нечего — верни ровно `(пусто)`.',
+  ].join('\n');
+  const user = `Журнал таска (chat.md):\n---\n${journal}\n---`;
+  const text = await runRole({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model, system, user });
+  const trimmed = text.trim();
+  const target = join(taskDir, 'knowledge-candidates.md');
+  const tmp = `${target}.tmp`;
+  await writeFile(tmp, trimmed === '(пусто)' ? '' : trimmed + '\n');
+  await rename(tmp, target);
+}
+
 export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const chatPath = join(opts.taskDir, CHAT_FILE);
   const vaultRoot = opts.vaultRoot ?? opts.taskDir;
@@ -253,23 +302,6 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
-
-  // Baseline-снапшот «до всех изменений»: снимается один раз на первом прогоне
-  // (если манифеста ещё нет) — фиксирует состояние существующих объектов; для
-  // create-объектов список пуст (= «до» ничего не было). В dry-run не пишем.
-  if (opts.mcp !== undefined && !opts.dryRun) {
-    const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
-    if (baselineManifest === null) {
-      const objs = await collectTaskObjects(opts.taskDir);
-      const existing: TFdDbObject[] = [];
-      for (const o of objs) {
-        const l = await makeLookup(opts.mcp, connection)(o.objPath);
-        if (l.exists) existing.push(o);
-      }
-      const defs = await collectSnapshot(existing, makeGetDefinition(opts.mcp, connection));
-      await captureSnapshot(opts.taskDir, 'baseline', defs);
-    }
-  }
 
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
@@ -316,6 +348,22 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // edit ⇒ есть, тип в БД совпадает. Только на входе кодера (ISSUE→AI.CODER).
     if (step.section === 'CODE' && opts.mcp !== undefined) {
       const plan = await collectTaskObjects(opts.taskDir);
+      // Baseline «до всех изменений»: один раз, при первом входе кодера (план уже
+      // зафиксирован в issue-app.md). Для create-объектов список пуст (= «до» ничего
+      // не было). В dry-run не пишем.
+      if (!opts.dryRun) {
+        const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
+        if (baselineManifest === null) {
+          const existing: TFdDbObject[] = [];
+          for (const o of plan) {
+            const l = await makeLookup(opts.mcp, connection)(o.objPath);
+            if (l.exists === true) existing.push(o);
+            else if (l.exists === null) result.errors.push(`baseline: cannot verify ${o.objPath}`);
+          }
+          const defs = await collectSnapshot(existing, makeGetDefinition(opts.mcp, connection));
+          await captureSnapshot(opts.taskDir, 'baseline', defs);
+        }
+      }
       const valErrs = await validateDbObject(plan, makeLookup(opts.mcp, connection));
       if (valErrs.length > 0) {
         result.errors = valErrs.map((e) => `${e.objPath}: ${e.error}`);
@@ -364,6 +412,14 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   }
   if (result.errors.length === 0 && result.stoppedFor === null && result.steps >= maxSteps && nextStep(content) !== null) {
     result.hitMaxSteps = true;
+  }
+  // Завершённый таск (DONE) → кандидаты в vault. Ошибка генерации не роняет прогон.
+  if (!opts.dryRun && level1List(content).some((l) => l.title === 'DONE')) {
+    try {
+      await generateKnowledgeCandidates(opts.spec, opts.providers, opts.taskDir, journal);
+    } catch {
+      // пропускаем: knowledge-candidates — не критично для результата таска
+    }
   }
   return result;
 }
