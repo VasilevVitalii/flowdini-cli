@@ -1,5 +1,5 @@
 // Драйвер цикла исполнения: nextStep → roleBrief → агент-роль (LLM + MCP) → раздел → taskCheck → снапшот.
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { textToStructure } from 'flowdini-spec';
 import type { TFdContent } from 'flowdini-spec';
@@ -16,7 +16,7 @@ import {
   collectSnapshot,
   captureSnapshot,
 } from 'flowdini-engine';
-import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec } from 'flowdini-engine';
+import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec, TFdDbObject } from 'flowdini-engine';
 import type { TFdProvidersConfig } from './config.js';
 import { resolveProvider } from './config.js';
 import { runRole } from './agent.js';
@@ -57,6 +57,31 @@ async function readIfExists(path: string): Promise<string | null> {
   }
 }
 
+// Все OBJECT-объекты таска: они живут в issue-app.md/result-app.md, а НЕ в chat.md.
+// Драйвер снапшота читает их из всех .md таска, дедуп по obj-path.
+async function collectTaskObjects(taskDir: string): Promise<TFdDbObject[]> {
+  const seen = new Set<string>();
+  const objects: TFdDbObject[] = [];
+  let entries: string[] = [];
+  try {
+    entries = await readdir(taskDir);
+  } catch {
+    return objects;
+  }
+  for (const name of entries) {
+    if (!name.endsWith('.md')) continue;
+    const text = await readIfExists(join(taskDir, name));
+    if (text === null) continue;
+    for (const o of extractDbObjects(textToStructure(text, true))) {
+      if (!seen.has(o.objPath)) {
+        seen.add(o.objPath);
+        objects.push(o);
+      }
+    }
+  }
+  return objects;
+}
+
 function specLines(spec: TFdRoleSpec): string {
   const parts: string[] = [];
   if (spec.model !== undefined) parts.push(`model: ${spec.model}`);
@@ -73,6 +98,7 @@ async function buildSystemPrompt(
   vault: string[],
   vaultRoot: string,
   gate: boolean,
+  connection: string | null,
 ): Promise<string> {
   const lines: string[] = [];
   lines.push(`Ты — роль «${role}» в процессе разработки по методологии flowdini.`);
@@ -105,6 +131,9 @@ async function buildSystemPrompt(
   }
   lines.push('');
   const rights = spec.rights as Record<string, unknown> | undefined;
+  if (connection !== null) {
+    lines.push(`Подключение к БД — «${connection}»: передавай его в аргумент \`connection\` каждого инструмента БД (execute_sql / get_definition / …).`);
+  }
   if (rights !== undefined) {
     const db = rights.db;
     if (db === 'read') {
@@ -133,6 +162,11 @@ function buildUserPrompt(
   if (section !== null) {
     lines.push(`Напиши раздел «# ${section} ${l1Number}».`);
     lines.push(`Свойства: [fd-from:: ${role}] [fd-createdAt:: <текущее время ISO8601>] [fd-reply:: [[#${arcAddr}]]].`);
+    if (section === 'CODE' || section === 'FIX') {
+      lines.push('Обязательно добавь в свойства [fd-to:: AI.REVIEWER] — результат идёт на ревью.');
+    } else if (section === 'ANSWERS') {
+      lines.push('Обязательно добавь в свойства [fd-to:: AI.ANALYST].');
+    }
   } else {
     lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше; укажи fd-reply на дугу).');
   }
@@ -226,7 +260,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       break;
     }
     const gate = step.section === 'REVIEW' && gateDue(content, opts.spec);
-    const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate);
+    const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, nextL1Number(content, step.section ?? 'ISSUE'));
     const tools = roleTools(opts.spec, role, opts.mcp);
     const callTool = opts.mcp !== undefined
@@ -238,6 +272,17 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
           return opts.mcp!.call(n, a);
         }
       : undefined;
+
+    // Пре-проверка плана кодера (OBJECT в issue-app.md): create ⇒ объекта ещё нет,
+    // edit ⇒ есть, тип в БД совпадает. Только на входе кодера (ISSUE→AI.CODER).
+    if (step.section === 'CODE' && opts.mcp !== undefined) {
+      const plan = await collectTaskObjects(opts.taskDir);
+      const valErrs = await validateDbObject(plan, makeLookup(opts.mcp, connection));
+      if (valErrs.length > 0) {
+        result.errors = valErrs.map((e) => `${e.objPath}: ${e.error}`);
+        break;
+      }
+    }
 
     const sectionText = await runRole({
       baseUrl: provider.baseUrl,
@@ -263,14 +308,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // Снапшот после CODE/FIX: определения объектов → captureSnapshot.
     if (step.section === 'CODE' || step.section === 'FIX') {
       if (opts.mcp !== undefined) {
-        const objects = extractDbObjects(content);
-        const lookup = makeLookup(opts.mcp, connection);
-        const valErrs = await validateDbObject(objects, lookup);
-        if (valErrs.length > 0) {
-          result.errors = valErrs.map((e) => `${e.objPath}: ${e.error}`);
-          break;
-        }
-        const defs = await collectSnapshot(objects, makeGetDefinition(opts.mcp, connection));
+        const defs = await collectSnapshot(await collectTaskObjects(opts.taskDir), makeGetDefinition(opts.mcp, connection));
         const iteration = level1List(content).filter((l) => l.title === 'CODE' || l.title === 'FIX').length;
         await captureSnapshot(opts.taskDir, iteration, defs);
       }
