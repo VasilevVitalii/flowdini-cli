@@ -35,8 +35,14 @@ export async function startMcp(vvdbDir: string, configPath: string): Promise<TFd
       content?: Array<{ type: string; text?: string }>;
       isError?: boolean;
     };
-    const text = (res.content ?? []).map((c) => c.text ?? '').join('');
-    if (res.isError === true) throw new Error(`MCP ${tool}: ${text}`);
+    // Только text-части, через \n (не впустую — иначе несколько частей склеиваются в кашу).
+    const text = (res.content ?? [])
+      .filter((c) => c.type === 'text')
+      .map((c) => c.text ?? '')
+      .join('\n');
+    if (res.isError === true) {
+      throw new Error(`MCP ${tool}: ${text || '(пустое сообщение об ошибке)'}`);
+    }
     return text;
   };
   return { tools, call, close: () => client.close() };

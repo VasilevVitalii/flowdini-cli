@@ -8,6 +8,7 @@ import {
   collectTaskObjects,
   buildUserPrompt,
   isNotFoundError,
+  snapshotDefinitions,
 } from '../src/driver.js';
 import type { TFdMcpClient } from '../src/mcp.js';
 
@@ -128,6 +129,46 @@ describe('collectTaskObjects', () => {
     await writeFile(join(dir, 'result-app.md'), b);
     const objs = await collectTaskObjects(dir);
     expect(objs.filter((o) => o.objPath === 'dbo.dup').length).toBe(1);
+  });
+});
+
+describe('snapshotDefinitions', () => {
+  const obj = (objPath: string) => ({ objPath, objKind: 'procedure', objAction: 'edit' as const });
+
+  it('найденные → в снапшот, ошибок нет', async () => {
+    const errors: string[] = [];
+    const defs = await snapshotDefinitions([obj('dbo.a'), obj('dbo.b')], async (p) => `DEF ${p}`, errors);
+    expect(defs).toEqual([
+      { objPath: 'dbo.a', definition: 'DEF dbo.a' },
+      { objPath: 'dbo.b', definition: 'DEF dbo.b' },
+    ]);
+    expect(errors).toEqual([]);
+  });
+
+  it('not_found → «объекта нет в БД», объект пропущен', async () => {
+    const errors: string[] = [];
+    const defs = await snapshotDefinitions(
+      [obj('dbo.a')],
+      async () => {
+        throw new Error('definition not found: dbo.a');
+      },
+      errors,
+    );
+    expect(defs).toEqual([]);
+    expect(errors).toEqual(['snapshot: dbo.a: объекта нет в БД']);
+  });
+
+  it('сбой MCP → ошибка с текстом, объект пропущен', async () => {
+    const errors: string[] = [];
+    const defs = await snapshotDefinitions(
+      [obj('dbo.a')],
+      async () => {
+        throw new Error('connection refused');
+      },
+      errors,
+    );
+    expect(defs).toEqual([]);
+    expect(errors).toEqual(['snapshot: dbo.a: connection refused']);
   });
 });
 

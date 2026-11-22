@@ -13,7 +13,6 @@ import {
   resolveRole,
   extractDbObjects,
   validateDbObject,
-  collectSnapshot,
   captureSnapshot,
 } from 'flowdini-engine';
 import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec, TFdDbObject } from 'flowdini-engine';
@@ -260,6 +259,28 @@ export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGet
   };
 }
 
+/** Снять определения для снапшота: найденные → в снапшот; объект отсутствует → ошибка
+ * «объекта нет в БД»; сбой MCP (сеть/права) → отдельная ошибка с текстом. Прогон не роняем. */
+export async function snapshotDefinitions(
+  objects: TFdDbObject[],
+  getDefinition: TFdGetDefinition,
+  errors: string[],
+): Promise<Array<{ objPath: string; definition: string }>> {
+  const found: Array<{ objPath: string; definition: string }> = [];
+  for (const o of objects) {
+    try {
+      found.push({ objPath: o.objPath, definition: await getDefinition(o.objPath) });
+    } catch (e) {
+      if (isNotFoundError(e)) {
+        errors.push(`snapshot: ${o.objPath}: объекта нет в БД`);
+      } else {
+        errors.push(`snapshot: ${o.objPath}: ${String((e as Error)?.message ?? e)}`);
+      }
+    }
+  }
+  return found;
+}
+
 function roleTools(spec: TFdSpecConfig, role: string, mcp?: TFdMcpClient): TFdMcpTool[] | undefined {
   if (mcp === undefined) return undefined;
   const names = resolveRole(spec, role).tools;
@@ -360,7 +381,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
             if (l.exists === true) existing.push(o);
             else if (l.exists === null) result.errors.push(`baseline: cannot verify ${o.objPath}`);
           }
-          const defs = await collectSnapshot(existing, makeGetDefinition(opts.mcp, connection));
+          const defs = await snapshotDefinitions(existing, makeGetDefinition(opts.mcp, connection), result.errors);
           await captureSnapshot(opts.taskDir, 'baseline', defs);
         }
       }
@@ -404,7 +425,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // Снапшот после CODE/FIX: определения объектов → captureSnapshot.
     if (step.section === 'CODE' || step.section === 'FIX') {
       if (opts.mcp !== undefined) {
-        const defs = await collectSnapshot(await collectTaskObjects(opts.taskDir), makeGetDefinition(opts.mcp, connection));
+        const defs = await snapshotDefinitions(await collectTaskObjects(opts.taskDir), makeGetDefinition(opts.mcp, connection), result.errors);
         const iteration = level1List(content).filter((l) => l.title === 'CODE' || l.title === 'FIX').length;
         await captureSnapshot(opts.taskDir, iteration, defs);
       }
