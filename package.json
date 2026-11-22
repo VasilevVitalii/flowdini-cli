@@ -1,0 +1,49 @@
+{
+  "name": "flowdini-cli",
+  "version": "0.1.0",
+  "description": "Autonomous runtime for flowdini: executes roles via LLM provider APIs and MCP (no external agents)",
+  "type": "module",
+  "bin": {
+    "flowdini": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "flowdini",
+    "cli",
+    "llm",
+    "mcp",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "Vitalii Vasilev",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "flowdini-engine": "file:../flowdini-engine",
+    "flowdini-spec": "^0.4.1",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
