@@ -30,6 +30,7 @@ export interface TFdRunOptions {
   vaultRoot?: string;
   connection?: string;
   maxSteps?: number;
+  dryRun?: boolean;
 }
 
 export interface TFdRunResult {
@@ -37,6 +38,8 @@ export interface TFdRunResult {
   stoppedFor: string | null;
   errors: string[];
   hitMaxSteps: boolean;
+  /** dry-run: тексты разделов, которые агент написал бы (не записаны в журнал). */
+  drySections: string[];
 }
 
 const CHAT_FILE = 'chat.md';
@@ -237,15 +240,15 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const vaultRoot = opts.vaultRoot ?? opts.taskDir;
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
-  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false };
+  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false, drySections: [] };
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
 
   // Baseline-снапшот «до всех изменений»: снимается один раз на первом прогоне
   // (если манифеста ещё нет) — фиксирует состояние существующих объектов; для
-  // create-объектов список пуст (= «до» ничего не было).
-  if (opts.mcp !== undefined) {
+  // create-объектов список пуст (= «до» ничего не было). В dry-run не пишем.
+  if (opts.mcp !== undefined && !opts.dryRun) {
     const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
     if (baselineManifest === null) {
       const objs = await collectTaskObjects(opts.taskDir);
@@ -283,7 +286,12 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, nextL1Number(content, step.section ?? 'ISSUE'));
     const tools = roleTools(opts.spec, role, opts.mcp);
     const callTool = opts.mcp !== undefined
-      ? async (n: string, a: Record<string, unknown>) => opts.mcp!.call(n, a)
+      ? async (n: string, a: Record<string, unknown>) => {
+          if (opts.dryRun && n === 'execute_sql') {
+            return JSON.stringify({ ok: true, skipped: true, note: 'dry-run: БД не изменялась' });
+          }
+          return opts.mcp!.call(n, a);
+        }
       : undefined;
 
     // Пре-проверка плана кодера (OBJECT в issue-app.md): create ⇒ объекта ещё нет,
@@ -306,6 +314,12 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       tools,
       callTool,
     });
+
+    // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.
+    if (opts.dryRun) {
+      result.drySections.push(sectionText.trim());
+      break;
+    }
 
     journal = `${journal.trimEnd()}\n\n${sectionText.trim()}\n`;
     await writeFile(chatPath, journal);

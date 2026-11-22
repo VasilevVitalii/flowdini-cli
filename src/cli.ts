@@ -71,7 +71,14 @@ async function main(): Promise<void> {
       vaultRoot: f['--vault-root'],
       connection: f['--connection'],
       maxSteps,
+      dryRun: f['--dry-run'] === 'true',
     });
+    if (res.drySections.length > 0) {
+      console.log('=== dry-run: раздел, который агент написал бы ===');
+      for (const s of res.drySections) console.log(s);
+      console.log('=== конец dry-run (журнал и БД не изменены) ===');
+      return;
+    }
     if (res.steps > 0) {
       console.log(`шагов выполнено: ${res.steps}`);
     }
