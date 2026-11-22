@@ -126,7 +126,7 @@ async function buildSystemPrompt(
   lines.push('2. Сразу следующей строкой — свойства в ОДНУ строку: `[fd-from:: {РОЛЬ}] [fd-createdAt:: {ISO8601}] [fd-reply:: [[#{АДРЕС_ДУГИ}]]]`.');
   lines.push('3. После строки свойств — пустая строка, затем тело раздела.');
   lines.push('4. Тело — по существу, на русском.');
-  lines.push('5. Вложенные заголовки — `## ИМЯ N` с номером (как в журнале).');
+  lines.push('5. Вложенные заголовки (`##`) — ОБЯЗАТЕЛЬНО с номером: `## ИМЯ N`. Заголовок без номера — ошибка валидации, раздел не примут. Если подзаголовки не нужны, пиши тело обычными абзацами/списками, без `##`.');
   if (gate) {
     lines.push('6. ОБЯЗАТЕЛЬНО: первым вложенным заголовком этого раздела должен быть `## Q N` (с номером, как у прочих вложенных заголовков) к HUMAN.CODER — вопрос, продолжать ли итерацию. Это гейт.');
   }
@@ -242,6 +242,23 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
+
+  // Baseline-снапшот «до всех изменений»: снимается один раз на первом прогоне
+  // (если манифеста ещё нет) — фиксирует состояние существующих объектов; для
+  // create-объектов список пуст (= «до» ничего не было).
+  if (opts.mcp !== undefined) {
+    const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
+    if (baselineManifest === null) {
+      const objs = await collectTaskObjects(opts.taskDir);
+      const existing: TFdDbObject[] = [];
+      for (const o of objs) {
+        const l = await makeLookup(opts.mcp, connection)(o.objPath);
+        if (l.exists) existing.push(o);
+      }
+      const defs = await collectSnapshot(existing, makeGetDefinition(opts.mcp, connection));
+      await captureSnapshot(opts.taskDir, 'baseline', defs);
+    }
+  }
 
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
