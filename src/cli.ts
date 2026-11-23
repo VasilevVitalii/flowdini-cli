@@ -23,19 +23,25 @@ Flags:
 `;
 }
 
+const VALUE_FLAGS = new Set([
+  '--spec', '--providers', '--vvdb', '--vvdb-config', '--vault-root', '--connection', '--max-steps',
+]);
+const BOOL_FLAGS = new Set(['--dry-run']);
+
 function flags(argv: string[]): Record<string, string> {
   const out: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
-        out[a] = next;
-        i++;
-      } else {
-        out[a] = 'true';
-      }
+    if (!a.startsWith('--')) throw new Error(`неожиданный аргумент: ${a}`);
+    if (BOOL_FLAGS.has(a)) {
+      out[a] = 'true';
+      continue;
     }
+    if (!VALUE_FLAGS.has(a)) throw new Error(`неизвестный флаг: ${a}`);
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('--')) throw new Error(`флаг ${a} требует значение`);
+    out[a] = next;
+    i++;
   }
   return out;
 }
@@ -66,7 +72,15 @@ async function main(): Promise<void> {
     ? await startMcp(vvdbDir, f['--vvdb-config'] ?? `${vvdbDir}/.connect.json`)
     : undefined;
 
-  const maxSteps = f['--max-steps'] !== undefined ? Number(f['--max-steps']) : 20;
+  let maxSteps = 20;
+  if (f['--max-steps'] !== undefined) {
+    const n = Number(f['--max-steps']);
+    if (!Number.isInteger(n) || n < 1) {
+      process.stderr.write(`--max-steps: ожидалось целое >= 1, получено «${f['--max-steps']}»\n`);
+      process.exit(2);
+    }
+    maxSteps = n;
+  }
 
   try {
     const res = await run({
@@ -91,6 +105,10 @@ async function main(): Promise<void> {
     }
     if (res.steps > 0) {
       console.log(`шагов выполнено: ${res.steps}`);
+    }
+    if (res.warnings.length > 0) {
+      console.log('предупреждения:');
+      for (const w of res.warnings) console.log(`  ⚠ ${w}`);
     }
     if (res.errors.length > 0) {
       console.log('ошибки:');

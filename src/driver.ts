@@ -40,6 +40,8 @@ export interface TFdRunResult {
   steps: number;
   stoppedFor: string | null;
   errors: string[];
+  /** Некритичные замечания прогона (например, недозволенный вызов инструмента). */
+  warnings: string[];
   hitMaxSteps: boolean;
   /** dry-run: тексты разделов, которые агент написал бы (не записаны в журнал). */
   drySections: string[];
@@ -343,11 +345,15 @@ export function buildUserPrompt(
 
 export function isNotFoundError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e);
-  return /not_found|не найден|not found|does not exist|doesn't exist/i.test(msg);
+  // Только маркеры «объекта нет» сервера vv-db-mcp (`[not_found] … не найден`).
+  // Широкие «not found»/«does not exist» ловили бы «database … does not exist» и
+  // «connection not found», выдавая сбой подключения за отсутствие объекта.
+  return /not_found|не найден/i.test(msg);
 }
 
 export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
+    // obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name).
     const parts = objPath.split('.');
     const name = parts[parts.length - 1];
     const schema = parts.length >= 2 ? parts[parts.length - 2] : undefined;
@@ -360,9 +366,14 @@ export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
           ...(schema !== undefined ? { schema } : {}),
         });
         const parsed = JSON.parse(text) as { ok?: boolean; definitions?: unknown[] };
-        if (parsed.ok === true && (parsed.definitions?.length ?? 0) > 0) {
+        if (parsed.ok !== true) {
+          // ok:false / нет ok — сбой в JSON, не «объекта нет» (канон: сбой — не «нет»).
+          return { exists: null, kind: null };
+        }
+        if ((parsed.definitions?.length ?? 0) > 0) {
           return { exists: true, kind };
         }
+        // ok:true с пустым definitions — не этот objectType; пробуем следующий.
       } catch (e) {
         // not_found → пробуем следующий objectType; сбой соединения/доступа НЕ скрываем.
         if (isNotFoundError(e)) continue;
@@ -375,6 +386,7 @@ export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
 
 export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinition {
   return async (objPath: string) => {
+    // obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name).
     const parts = objPath.split('.');
     const name = parts[parts.length - 1];
     const schema = parts.length >= 2 ? parts[parts.length - 2] : undefined;
@@ -387,16 +399,25 @@ export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGet
           ...(schema !== undefined ? { schema } : {}),
         });
         const parsed = JSON.parse(text) as { ok?: boolean; definitions?: Array<{ definition?: string }> };
-        if (parsed.ok === true && (parsed.definitions?.length ?? 0) > 0) {
-          return parsed.definitions![0].definition ?? '';
+        if (parsed.ok !== true) {
+          // ok:false / нет ok — сбой в JSON, не «объекта нет».
+          throw new Error(`get_definition: ${objPath}: ok:false (сбой, не «объекта нет»)`);
         }
+        if ((parsed.definitions?.length ?? 0) > 0) {
+          const definition = parsed.definitions![0].definition;
+          if (definition === undefined || definition.trim() === '') {
+            throw new Error(`get_definition: ${objPath}: пустое определение`);
+          }
+          return definition;
+        }
+        // ok:true с пустым definitions — не этот objectType; пробуем следующий.
       } catch (e) {
         // not_found → пробуем следующий objectType; сбой пробрасываем наружу.
         if (isNotFoundError(e)) continue;
         throw e;
       }
     }
-    throw new Error(`definition not found: ${objPath}`);
+    throw new Error(`объект ${objPath} не найден (ни procedure/function/view)`);
   };
 }
 
@@ -475,7 +496,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
   const fixMode = opts.spec.fixMode ?? 'item';
-  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false, drySections: [], dryWarnings: [] };
+  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], warnings: [], hitMaxSteps: false, drySections: [], dryWarnings: [] };
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
@@ -527,6 +548,9 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     });
     const tools = roleTools(opts.spec, role, opts.mcp);
     const allowedTools = new Set((tools ?? []).map((t) => t.name));
+    // budget.maxTurns (SPEC) — лимит tool-calling ходов на шаг роли; иначе 8 (по умолчанию).
+    const budgetTurns = brief.spec.budget?.maxTurns;
+    const maxTurns = typeof budgetTurns === 'number' && Number.isInteger(budgetTurns) && budgetTurns >= 1 ? budgetTurns : undefined;
     const callTool = opts.mcp !== undefined
       ? async (n: string, a: Record<string, unknown>) => {
           // Защита: агент может вызвать только инструменты своей роли (SPEC tools).
@@ -538,6 +562,8 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
               result.dryWarnings.push(`${n} (роль ${role})`);
               return JSON.stringify({ ok: false, forbidden: true, note: `инструмент ${n} не разрешён роли ${role}` });
             }
+            // Недозволенный вызов в обычном прогоне: оставляем след + сообщаем агенту.
+            result.warnings.push(`${n} (роль ${role})`);
             throw new Error(`инструмент ${n} не разрешён роли ${role}`);
           }
           if (verdict === 'skip') {
@@ -548,29 +574,34 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       : undefined;
 
     // Пре-проверка плана кодера (OBJECT в issue-app.md): create ⇒ объекта ещё нет,
-    // edit ⇒ есть, тип в БД совпадает. Только на входе кодера (ISSUE→AI.CODER).
+    // edit ⇒ есть, тип в БД совпадает. Только при ПЕРВОМ входе кодера (в журнале ещё
+    // нет CODE): после CODE объекты уже созданы, повторная сверка даст ложное «already exists».
     if (step.section === 'CODE' && opts.mcp !== undefined) {
-      const plan = await collectTaskObjects(opts.taskDir);
-      // Baseline «до всех изменений»: один раз, при первом входе кодера (план уже
-      // зафиксирован в issue-app.md). Для create-объектов список пуст (= «до» ничего
-      // не было). В dry-run не пишем.
-      if (!opts.dryRun) {
-        const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
-        if (baselineManifest === null) {
-          const existing: TFdDbObject[] = [];
-          for (const o of plan) {
-            const l = await makeLookup(opts.mcp, connection)(o.objPath);
-            if (l.exists === true) existing.push(o);
-            else if (l.exists === null) result.errors.push(`baseline: cannot verify ${o.objPath}`);
-          }
-          const defs = await snapshotDefinitions(existing, makeGetDefinition(opts.mcp, connection), result.errors);
-          await captureSnapshot(opts.taskDir, 'baseline', defs);
+      if (!level1List(content).some((l) => l.title === 'CODE')) {
+        const plan = await collectTaskObjects(opts.taskDir);
+        // Сначала сверка плана с БД: провал — стоп, ничего не пишем (в т.ч. baseline),
+        // чтобы после исправления плана baseline переснялся по-новому.
+        const valErrs = await validateDbObject(plan, makeLookup(opts.mcp, connection));
+        if (valErrs.length > 0) {
+          result.errors.push(...valErrs.map((e) => `${e.objPath}: ${e.error}`));
+          break;
         }
-      }
-      const valErrs = await validateDbObject(plan, makeLookup(opts.mcp, connection));
-      if (valErrs.length > 0) {
-        result.errors = valErrs.map((e) => `${e.objPath}: ${e.error}`);
-        break;
+        // Baseline «до всех изменений»: один раз, при первом входе кодера (план уже
+        // зафиксирован в issue-app.md и прошёл сверку). Для create-объектов список
+        // пуст (= «до» ничего не было). В dry-run не пишем.
+        if (!opts.dryRun) {
+          const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
+          if (baselineManifest === null) {
+            const existing: TFdDbObject[] = [];
+            for (const o of plan) {
+              const l = await makeLookup(opts.mcp, connection)(o.objPath);
+              if (l.exists === true) existing.push(o);
+              else if (l.exists === null) result.errors.push(`baseline: cannot verify ${o.objPath}`);
+            }
+            const defs = await snapshotDefinitions(existing, makeGetDefinition(opts.mcp, connection), result.errors);
+            await captureSnapshot(opts.taskDir, 'baseline', defs);
+          }
+        }
       }
     }
 
@@ -584,6 +615,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
         user,
         tools,
         callTool,
+        maxTurns,
       });
     } catch (err) {
       const msg = `${role}: ${err instanceof Error ? err.message : String(err)}`;
@@ -656,12 +688,16 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   if (result.errors.length === 0 && result.stoppedFor === null && result.steps >= maxSteps && nextStep(content) !== null) {
     result.hitMaxSteps = true;
   }
-  // Завершённый таск (DONE) → кандидаты в vault. Ошибка генерации не роняет прогон.
-  if (!opts.dryRun && level1List(content).some((l) => l.title === 'DONE')) {
-    try {
-      await generateKnowledgeCandidates(opts.spec, opts.providers, opts.taskDir, journal);
-    } catch {
-      // пропускаем: knowledge-candidates — не критично для результата таска
+  // Завершённый таск (последний L1 — DONE) → кандидаты в vault. Генерация только один
+  // раз (если файла ещё нет); ошибка генерации не роняет прогон.
+  const l1s = level1List(content);
+  if (!opts.dryRun && l1s.length > 0 && l1s[l1s.length - 1].title === 'DONE') {
+    if ((await readIfExists(join(opts.taskDir, 'knowledge-candidates.md'))) === null) {
+      try {
+        await generateKnowledgeCandidates(opts.spec, opts.providers, opts.taskDir, journal);
+      } catch {
+        // пропускаем: knowledge-candidates — не критично для результата таска
+      }
     }
   }
   return result;

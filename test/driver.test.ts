@@ -37,6 +37,12 @@ describe('isNotFoundError', () => {
   it('сбой соединения — false', () => {
     expect(isNotFoundError(new Error('connection refused'))).toBe(false);
   });
+  it('database does not exist — false (сбой БД, не «объекта нет»)', () => {
+    expect(isNotFoundError(new Error('database "x" does not exist'))).toBe(false);
+  });
+  it('connection not found — false (сбой подключения, не «объекта нет»)', () => {
+    expect(isNotFoundError(new Error('connection "x" not found'))).toBe(false);
+  });
 });
 
 describe('makeLookup', () => {
@@ -67,6 +73,11 @@ describe('makeLookup', () => {
     const lookup = makeLookup(mcp, 'mssql');
     await expect(lookup('dbo.sp_x')).resolves.toEqual({ exists: null, kind: null });
   });
+  it('ok:false в JSON — сбой, exists:null (не «объекта нет»)', async () => {
+    const mcp = mockMcp(() => JSON.stringify({ ok: false, note: 'connection lost' }));
+    const lookup = makeLookup(mcp, 'mssql');
+    await expect(lookup('dbo.sp_x')).resolves.toEqual({ exists: null, kind: null });
+  });
 });
 
 describe('makeGetDefinition', () => {
@@ -80,13 +91,13 @@ describe('makeGetDefinition', () => {
     await expect(get('dbo.sp_x')).resolves.toBe('CREATE PROCEDURE dbo.sp_x AS BEGIN SELECT 1 END');
   });
 
-  it('not_found по всем типам → бросает «definition not found»', async () => {
+  it('not_found по всем типам → бросает «не найден»', async () => {
     const mcp = mockMcp((_t, args) => {
       notFound(args.name);
       return '';
     });
     const get = makeGetDefinition(mcp, 'mssql');
-    await expect(get('dbo.x')).rejects.toThrow('definition not found');
+    await expect(get('dbo.x')).rejects.toThrow('не найден');
   });
 
   it('сбой соединения пробрасывается наружу', async () => {
@@ -95,6 +106,16 @@ describe('makeGetDefinition', () => {
     });
     const get = makeGetDefinition(mcp, 'mssql');
     await expect(get('dbo.x')).rejects.toThrow('connection refused');
+  });
+  it('ok:false в JSON — сбой, не «объекта нет»', async () => {
+    const mcp = mockMcp(() => JSON.stringify({ ok: false }));
+    const get = makeGetDefinition(mcp, 'mssql');
+    await expect(get('dbo.x')).rejects.toThrow('ok:false');
+  });
+  it('пустое определение — сбой, не «пустой» текст', async () => {
+    const mcp = mockMcp(() => JSON.stringify({ ok: true, definitions: [{ definition: '   ' }] }));
+    const get = makeGetDefinition(mcp, 'mssql');
+    await expect(get('dbo.x')).rejects.toThrow('пустое определение');
   });
 });
 
@@ -156,7 +177,8 @@ describe('snapshotDefinitions', () => {
     const defs = await snapshotDefinitions(
       [obj('dbo.a')],
       async () => {
-        throw new Error('definition not found: dbo.a');
+        notFound('dbo.a');
+        return '';
       },
       errors,
     );

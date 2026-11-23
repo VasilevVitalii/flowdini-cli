@@ -24,6 +24,7 @@ export async function chat(
   model: string,
   messages: TFdChatMessage[],
   tools?: TFdTool[],
+  timeoutMs = 180_000,
 ): Promise<TFdChatMessage> {
   const body: Record<string, unknown> = { model, messages };
   if (tools !== undefined && tools.length > 0) {
@@ -36,6 +37,7 @@ export async function chat(
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const text = await res.text();
