@@ -9,6 +9,7 @@ import {
   buildUserPrompt,
   nowStamp,
   stampHeader,
+  buildCrash,
   isNotFoundError,
   snapshotDefinitions,
 } from '../src/driver.js';
@@ -222,5 +223,27 @@ describe('stampHeader', () => {
 
   it('null (аналитик сам решает) — пусто, LLM пишет всё', () => {
     expect(stampHeader(null, 'AI.ANALYST', 1, 'ISSUE 1', now)).toBe('');
+  });
+});
+
+describe('buildCrash', () => {
+  it('маркер без свойств; ошибки и ответ AI — в ~~~-fence', () => {
+    const c = buildCrash(['chat.md: broken link: "[[#ISSUE 9]]"'], '## BUG\n[fd-from:: AI.REVIEWER]');
+    expect(c).toBe(
+      '# CRASH 1\n\nПроцесс остановлен из-за непредвиденной ошибки. Разбери, исправь, удали этот раздел и перезапусти.\n\nОшибки:\n\n~~~\nchat.md: broken link: "[[#ISSUE 9]]"\n~~~\n\nОтвет AI, породивший ошибки:\n\n~~~\n## BUG\n[fd-from:: AI.REVIEWER]\n~~~',
+    );
+  });
+
+  it('без ответа AI — только ошибки, подписи «Ответ AI» нет', () => {
+    const c = buildCrash(['ошибка']);
+    expect(c).toContain('# CRASH 1');
+    expect(c).toContain('~~~\nошибка\n~~~');
+    expect(c).not.toContain('Ответ AI');
+  });
+
+  it('без ошибок и ответа — только маркер и подсказка', () => {
+    const c = buildCrash([]);
+    expect(c).toContain('# CRASH 1');
+    expect(c).not.toContain('~~~');
   });
 });

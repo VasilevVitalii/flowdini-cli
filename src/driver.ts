@@ -9,6 +9,7 @@ import {
   gateDue,
   taskCheck,
   level1List,
+  isCrashed,
   roleCovers,
   resolveRole,
   extractDbObjects,
@@ -195,6 +196,25 @@ export function stampHeader(
   return `${head}\n\n`;
 }
 
+/** Терминальный маркер аварии `# CRASH 1` (без свойств, хост не притворяется ролью):
+ *  ошибки + сырой ответ AI. Обе части — в `~~~`-fence: `taskCheck` не проверяет
+ *  ссылки внутри fence (`stripFences`), а `~~~` не конфликтует с ```-блоками SQL,
+ *  которые AI пишет в CODE/FIX. */
+export function buildCrash(errors: string[], rawAnswer?: string): string {
+  const out = [
+    '# CRASH 1',
+    '',
+    'Процесс остановлен из-за непредвиденной ошибки. Разбери, исправь, удали этот раздел и перезапусти.',
+  ];
+  if (errors.length > 0) {
+    out.push('', 'Ошибки:', '', '~~~', ...errors, '~~~');
+  }
+  if (rawAnswer !== undefined && rawAnswer.trim() !== '') {
+    out.push('', 'Ответ AI, породивший ошибки:', '', '~~~', rawAnswer.trimEnd(), '~~~');
+  }
+  return out.join('\n');
+}
+
 export function buildUserPrompt(
   role: string,
   journal: string,
@@ -350,7 +370,13 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
 
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
-    if (step === null) break; // DONE или нет открытых дуг
+    if (step === null) {
+      // Движок останавливает на CRASH так же, как на DONE; здесь различаем причину.
+      if (isCrashed(content)) {
+        result.errors.push('журнал содержит # CRASH — разбери, исправь, удали раздел и перезапусти');
+      }
+      break;
+    }
     const addressedRole = step.roles[0];
     if (roleCovers('HUMAN', addressedRole)) {
       result.stoppedFor = addressedRole;
@@ -417,15 +443,25 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       }
     }
 
-    const sectionText = await runRole({
-      baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
-      model,
-      system,
-      user,
-      tools,
-      callTool,
-    });
+    let sectionText: string;
+    try {
+      sectionText = await runRole({
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        model,
+        system,
+        user,
+        tools,
+        callTool,
+      });
+    } catch (err) {
+      const msg = `${role}: ${err instanceof Error ? err.message : String(err)}`;
+      const tmpPath = `${chatPath}.tmp`;
+      await writeFile(tmpPath, `${journal.trimEnd()}\n\n${buildCrash([msg])}\n`);
+      await rename(tmpPath, chatPath);
+      result.errors.push(msg);
+      break;
+    }
 
     // Хост проставляет L1-заголовок (и свойства для CODE) поверх тела от LLM.
     const entry = `${stampHeader(step.section, role, l1Number, step.arc.addr)}${sectionText.trim()}`;
@@ -436,19 +472,24 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       break;
     }
 
-    journal = `${journal.trimEnd()}\n\n${entry.trim()}\n`;
+    const candidate = `${journal.trimEnd()}\n\n${entry.trim()}\n`;
     // Атомарная запись: tmp + rename — журнал никогда не остаётся полузаписанным.
     const tmpPath = `${chatPath}.tmp`;
-    await writeFile(tmpPath, journal);
+    await writeFile(tmpPath, candidate);
     await rename(tmpPath, chatPath);
-    content = textToStructure(journal, true);
+    content = textToStructure(candidate, true);
     result.steps++;
 
     const errs = await taskCheck(opts.taskDir);
     if (errs.length > 0) {
+      // Битый раздел не оставляем: откат к состоянию ДО ответа роли + # CRASH.
+      const crashBody = buildCrash(errs.map((e) => `${e.relativeFileName}: ${e.error}`), sectionText);
+      await writeFile(tmpPath, `${journal.trimEnd()}\n\n${crashBody}\n`);
+      await rename(tmpPath, chatPath);
       result.errors = errs.map((e) => `${e.relativeFileName}: ${e.error}`);
       break;
     }
+    journal = candidate;
 
     // Снапшот после CODE/FIX: определения объектов → captureSnapshot.
     if (step.section === 'CODE' || step.section === 'FIX') {
