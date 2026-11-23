@@ -48,8 +48,12 @@ export async function chat(
   };
   const msg = data.choices?.[0]?.message;
   if (!msg) throw new Error('LLM: пустой ответ (нет choices)');
+  const role = msg.role;
+  if (role !== undefined && !['system', 'user', 'assistant', 'tool'].includes(role)) {
+    throw new Error(`LLM: неизвестная роль ответа: "${role}"`);
+  }
   return {
-    role: (msg.role as TFdChatMessage['role']) ?? 'assistant',
+    role: (role as TFdChatMessage['role']) ?? 'assistant',
     content: msg.content ?? null,
     tool_calls: msg.tool_calls,
   };

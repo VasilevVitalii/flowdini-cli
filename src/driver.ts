@@ -15,9 +15,11 @@ import {
   resolveRole,
   extractDbObjects,
   validateDbObject,
+  collectSnapshot,
   captureSnapshot,
   fixReference,
   acceptOf,
+  nowStamp,
 } from 'flowdini-engine';
 import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec, TFdDbObject } from 'flowdini-engine';
 import type { TFdProvidersConfig } from './config.js';
@@ -177,10 +179,7 @@ async function buildSystemPrompt(
   return lines.join('\n');
 }
 
-/** Каноничный `fd-createdAt` (`YYYY-MM-DDTHH:MM:SSZ`), формат как в `pretty.ts` движка. */
-export function nowStamp(now: () => Date): string {
-  return now().toISOString().replace(/\.\d{3}Z$/, 'Z');
-}
+export { nowStamp };
 
 /** L1-заголовок раздела, который проставляет ХОСТ (не LLM), по канону:
  *  - `CODE` — заголовок + свойства (`fd-from`, `fd-createdAt`, `fd-to:: AI.REVIEWER`, `fd-reply`);
@@ -351,34 +350,61 @@ export function isNotFoundError(e: unknown): boolean {
   return /not_found|не найден/i.test(msg);
 }
 
+const DB_KINDS = ['procedure', 'function', 'view'] as const;
+
+/** obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name). */
+function splitObjPath(objPath: string): { name: string; schema: string | undefined } {
+  const parts = objPath.split('.');
+  return {
+    name: parts[parts.length - 1],
+    schema: parts.length >= 2 ? parts[parts.length - 2] : undefined,
+  };
+}
+
+/** Один вызов `get_definition` по одному objectType.
+ * `notfound` — ok:true с пустым definitions (не этот тип) или not_found;
+ * `okfalse` — ok:false/нет ok (сбой JSON, не «объекта нет»);
+ * `{ definitions }` — найден. Сбой сети/прав пробрасывается. */
+type TProbe = 'notfound' | 'okfalse' | { definitions: Array<{ definition?: string }> };
+
+async function probeDefinition(
+  mcp: TFdMcpClient,
+  connection: string,
+  name: string,
+  schema: string | undefined,
+  kind: string,
+): Promise<TProbe> {
+  let text: string;
+  try {
+    text = await mcp.call('get_definition', {
+      connection,
+      name,
+      objectType: kind,
+      ...(schema !== undefined ? { schema } : {}),
+    });
+  } catch (e) {
+    if (isNotFoundError(e)) return 'notfound';
+    throw e;
+  }
+  const parsed = JSON.parse(text) as { ok?: boolean; definitions?: Array<{ definition?: string }> };
+  if (parsed.ok !== true) return 'okfalse';
+  if ((parsed.definitions?.length ?? 0) === 0) return 'notfound';
+  return { definitions: parsed.definitions! };
+}
+
 export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
-    // obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name).
-    const parts = objPath.split('.');
-    const name = parts[parts.length - 1];
-    const schema = parts.length >= 2 ? parts[parts.length - 2] : undefined;
-    for (const kind of ['procedure', 'function', 'view']) {
+    const { name, schema } = splitObjPath(objPath);
+    for (const kind of DB_KINDS) {
+      let probe: TProbe;
       try {
-        const text = await mcp.call('get_definition', {
-          connection,
-          name,
-          objectType: kind,
-          ...(schema !== undefined ? { schema } : {}),
-        });
-        const parsed = JSON.parse(text) as { ok?: boolean; definitions?: unknown[] };
-        if (parsed.ok !== true) {
-          // ok:false / нет ok — сбой в JSON, не «объекта нет» (канон: сбой — не «нет»).
-          return { exists: null, kind: null };
-        }
-        if ((parsed.definitions?.length ?? 0) > 0) {
-          return { exists: true, kind };
-        }
-        // ok:true с пустым definitions — не этот objectType; пробуем следующий.
-      } catch (e) {
-        // not_found → пробуем следующий objectType; сбой соединения/доступа НЕ скрываем.
-        if (isNotFoundError(e)) continue;
-        return { exists: null, kind: null };
+        probe = await probeDefinition(mcp, connection, name, schema, kind);
+      } catch {
+        return { exists: null, kind: null }; // сбой соединения/доступа
       }
+      if (probe === 'notfound') continue;
+      if (probe === 'okfalse') return { exists: null, kind: null }; // сбой JSON, не «нет»
+      return { exists: true, kind };
     }
     return { exists: false, kind: null };
   };
@@ -386,61 +412,45 @@ export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
 
 export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinition {
   return async (objPath: string) => {
-    // obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name).
-    const parts = objPath.split('.');
-    const name = parts[parts.length - 1];
-    const schema = parts.length >= 2 ? parts[parts.length - 2] : undefined;
-    for (const kind of ['procedure', 'function', 'view']) {
+    const { name, schema } = splitObjPath(objPath);
+    for (const kind of DB_KINDS) {
+      let probe: TProbe;
       try {
-        const text = await mcp.call('get_definition', {
-          connection,
-          name,
-          objectType: kind,
-          ...(schema !== undefined ? { schema } : {}),
-        });
-        const parsed = JSON.parse(text) as { ok?: boolean; definitions?: Array<{ definition?: string }> };
-        if (parsed.ok !== true) {
-          // ok:false / нет ok — сбой в JSON, не «объекта нет».
-          throw new Error(`get_definition: ${objPath}: ok:false (сбой, не «объекта нет»)`);
-        }
-        if ((parsed.definitions?.length ?? 0) > 0) {
-          const definition = parsed.definitions![0].definition;
-          if (definition === undefined || definition.trim() === '') {
-            throw new Error(`get_definition: ${objPath}: пустое определение`);
-          }
-          return definition;
-        }
-        // ok:true с пустым definitions — не этот objectType; пробуем следующий.
+        probe = await probeDefinition(mcp, connection, name, schema, kind);
       } catch (e) {
-        // not_found → пробуем следующий objectType; сбой пробрасываем наружу.
-        if (isNotFoundError(e)) continue;
-        throw e;
+        throw e; // сбой сети/прав пробрасываем наружу
       }
+      if (probe === 'notfound') continue;
+      if (probe === 'okfalse') {
+        throw new Error(`get_definition: ${objPath}: ok:false (сбой, не «объекта нет»)`);
+      }
+      const definition = probe.definitions[0].definition;
+      if (definition === undefined || definition.trim() === '') {
+        throw new Error(`get_definition: ${objPath}: пустое определение`);
+      }
+      return definition;
     }
     throw new Error(`объект ${objPath} не найден (ни procedure/function/view)`);
   };
 }
 
-/** Снять определения для снапшота: найденные → в снапшот; объект отсутствует → ошибка
- * «объекта нет в БД»; сбой MCP (сеть/права) → отдельная ошибка с текстом. Прогон не роняем. */
-export async function snapshotDefinitions(
+/** Снять определения для снапшота через движок (`collectSnapshot` с onError):
+ * объект отсутствует → «объекта нет в БД»; сбой MCP → отдельная ошибка с текстом.
+ * Прогон не роняем. Различение not_found/сбой — по контракту vv-db-mcp. */
+export function snapshotDefinitions(
   objects: TFdDbObject[],
   getDefinition: TFdGetDefinition,
   errors: string[],
 ): Promise<Array<{ objPath: string; definition: string }>> {
-  const found: Array<{ objPath: string; definition: string }> = [];
-  for (const o of objects) {
-    try {
-      found.push({ objPath: o.objPath, definition: await getDefinition(o.objPath) });
-    } catch (e) {
-      if (isNotFoundError(e)) {
-        errors.push(`snapshot: ${o.objPath}: объекта нет в БД`);
-      } else {
-        errors.push(`snapshot: ${o.objPath}: ${String((e as Error)?.message ?? e)}`);
-      }
-    }
-  }
-  return found;
+  return collectSnapshot(objects, getDefinition, {
+    onError: (objPath, e) => {
+      errors.push(
+        isNotFoundError(e)
+          ? `snapshot: ${objPath}: объекта нет в БД`
+          : `snapshot: ${objPath}: ${String((e as Error)?.message ?? e)}`,
+      );
+    },
+  });
 }
 
 function roleTools(spec: TFdSpecConfig, role: string, mcp?: TFdMcpClient): TFdMcpTool[] | undefined {

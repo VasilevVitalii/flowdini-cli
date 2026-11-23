@@ -19,7 +19,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -37,8 +37,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "flowdini-engine": "^0.1.6",
-    "flowdini-spec": "^0.4.1",
+    "flowdini-engine": "^0.1.7",
+    "flowdini-spec": "^0.4.3",
     "yaml": "^2.9.1"
   },
   "devDependencies": {
