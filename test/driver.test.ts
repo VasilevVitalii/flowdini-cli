@@ -7,6 +7,8 @@ import {
   makeGetDefinition,
   collectTaskObjects,
   buildUserPrompt,
+  nowStamp,
+  stampHeader,
   isNotFoundError,
   snapshotDefinitions,
 } from '../src/driver.js';
@@ -173,15 +175,52 @@ describe('snapshotDefinitions', () => {
 });
 
 describe('buildUserPrompt', () => {
-  it('CODE подсказывает fd-to:: AI.REVIEWER', () => {
+  it('CODE: хост пишет заголовок, LLM — только тело', () => {
     const p = buildUserPrompt('AI.CODER.JUNIOR', 'журнал', 'CODE', 'ISSUE 1', 1);
-    expect(p).toContain('fd-to:: AI.REVIEWER');
-    expect(p).toContain('[fd-from:: AI.CODER.JUNIOR]');
+    expect(p).toContain('проставляет хост');
+    expect(p).toContain('только тело');
+    expect(p).not.toContain('[fd-from:: AI.CODER.JUNIOR]');
+    expect(p).not.toContain('Напиши раздел «# CODE 1»');
   });
 
-  it('REVIEW подсказывает вложенные ## BUG N', () => {
+  it('REVIEW подсказывает вложенные ## BUG N и роль ревьюера', () => {
     const p = buildUserPrompt('AI.REVIEWER', 'журнал', 'REVIEW', 'CODE 1', 2);
     expect(p).toContain('## BUG N');
     expect(p).toContain('AI.CODER.SENIOR');
+    expect(p).toContain('проставляет хост');
+  });
+
+  it('FIX подсказывает вложенные заголовки и fd-to:: AI.REVIEWER', () => {
+    const p = buildUserPrompt('AI.CODER.SENIOR', 'журнал', 'FIX', 'REVIEW 1#BUG 1', 2);
+    expect(p).toContain('AI.CODER.SENIOR');
+    expect(p).toContain('fd-to:: AI.REVIEWER');
+    expect(p).toContain('проставляет хост');
+  });
+});
+
+describe('nowStamp', () => {
+  it('каноничный ISO8601 без миллисекунд', () => {
+    const s = nowStamp(() => new Date('2026-11-23T10:20:30.456Z'));
+    expect(s).toBe('2026-11-23T10:20:30Z');
+  });
+});
+
+describe('stampHeader', () => {
+  const now = () => new Date('2026-11-23T10:20:30.456Z');
+
+  it('CODE — заголовок + все свойства (fd-from, fd-createdAt, fd-to, fd-reply)', () => {
+    const h = stampHeader('CODE', 'AI.CODER.JUNIOR', 2, 'ISSUE 3', now);
+    expect(h).toBe(
+      '# CODE 2\n[fd-from:: AI.CODER.JUNIOR] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: AI.REVIEWER] [fd-reply:: [[#ISSUE 3]]]\n\n',
+    );
+  });
+
+  it('REVIEW/FIX — заголовок-контейнер без свойств', () => {
+    expect(stampHeader('REVIEW', 'AI.REVIEWER', 1, 'CODE 1', now)).toBe('# REVIEW 1\n\n');
+    expect(stampHeader('FIX', 'AI.CODER.SENIOR', 1, 'REVIEW 1#BUG 1', now)).toBe('# FIX 1\n\n');
+  });
+
+  it('null (аналитик сам решает) — пусто, LLM пишет всё', () => {
+    expect(stampHeader(null, 'AI.ANALYST', 1, 'ISSUE 1', now)).toBe('');
   });
 });

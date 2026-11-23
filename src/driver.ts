@@ -144,8 +144,8 @@ async function buildSystemPrompt(
     }
   }
   lines.push('Правила формата раздела (строго):');
-  lines.push('1. Заголовок: `# {РАЗДЕЛ} {N}` — имя и номер подсказаны в запросе.');
-  lines.push('2. Сразу следующей строкой — свойства в ОДНУ строку: `[fd-from:: {РОЛЬ}] [fd-createdAt:: {ISO8601}] [fd-reply:: [[#{АДРЕС_ДУГИ}]]]`.');
+  lines.push('1. Заголовок L1: `# {РАЗДЕЛ} {N}` (с номером).');
+  lines.push('2. Свойства — ОДНОЙ строкой сразу под заголовком, в порядке `fd-from`, `fd-createdAt`, `fd-to`, `fd-reply`.');
   lines.push('3. После строки свойств — пустая строка, затем тело раздела.');
   lines.push('4. Тело — по существу, на русском.');
   lines.push('5. Вложенные заголовки (`##`) — ОБЯЗАТЕЛЬНО с номером: `## ИМЯ N`. Заголовок без номера — ошибка валидации, раздел не примут. Если подзаголовки не нужны, пиши тело обычными абзацами/списками, без `##`.');
@@ -170,6 +170,31 @@ async function buildSystemPrompt(
   return lines.join('\n');
 }
 
+/** Каноничный `fd-createdAt` (`YYYY-MM-DDTHH:MM:SSZ`), формат как в `pretty.ts` движка. */
+export function nowStamp(now: () => Date): string {
+  return now().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** L1-заголовок раздела, который проставляет ХОСТ (не LLM), по канону:
+ *  - `CODE` — заголовок + свойства (`fd-from`, `fd-createdAt`, `fd-to:: AI.REVIEWER`, `fd-reply`);
+ *  - `REVIEW`/`FIX` — заголовок-контейнер без свойств (свойства на вложенных `##`);
+ *  - `null` (аналитик сам решает) — пусто: хост не знает раздела, LLM пишет всё.
+ *  `now` — источник времени (инъекция для тестов). */
+export function stampHeader(
+  section: string | null,
+  role: string,
+  l1Number: number,
+  arcAddr: string,
+  now: () => Date = () => new Date(),
+): string {
+  if (section === null) return '';
+  const head = `# ${section} ${l1Number}`;
+  if (section === 'CODE') {
+    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]\n\n`;
+  }
+  return `${head}\n\n`;
+}
+
 export function buildUserPrompt(
   role: string,
   journal: string,
@@ -185,14 +210,13 @@ export function buildUserPrompt(
   lines.push('');
   lines.push(`Следующий ход: роль «${role}» отвечает на дугу «${arcAddr}».`);
   if (section !== null) {
-    lines.push(`Напиши раздел «# ${section} ${l1Number}».`);
-    lines.push(`Свойства: [fd-from:: ${role}] [fd-createdAt:: <текущее время ISO8601>] [fd-reply:: [[#${arcAddr}]]].`);
-    if (section === 'CODE' || section === 'FIX') {
-      lines.push('Обязательно добавь в свойства [fd-to:: AI.REVIEWER] — результат идёт на ревью.');
-    } else if (section === 'ANSWERS') {
-      lines.push('Обязательно добавь в свойства [fd-to:: AI.ANALYST].');
+    lines.push(`L1-заголовок «# ${section} ${l1Number}» и его свойства проставляет хост — ты их НЕ пиши, начинай сразу с содержимого.`);
+    if (section === 'CODE') {
+      lines.push('Напиши только тело раздела (обычные абзацы/списки, без заголовков).');
+    } else if (section === 'FIX') {
+      lines.push('Пиши вложенные заголовки: под каждое замечание из ревью — «## {ИМЯ} N» (тот же BUG/RISK/OTHER и номер, что в ревью) с телом и свойствами `[fd-from:: AI.CODER.SENIOR] [fd-createdAt:: <текущее время ISO8601>] [fd-to:: AI.REVIEWER] [fd-reply:: [[#<пункт ревью>]]]`.');
     } else if (section === 'REVIEW') {
-      lines.push('Если нашёл замечания — под каждое вложенный «## BUG N» (только новые, не повторяй уже закрытые) со свойствами [fd-from:: AI.REVIEWER] [fd-to:: AI.CODER.SENIOR]. Если замечаний нет — НЕ добавляй fd-to: дальше решает человек (DONE или новый ISSUE).');
+      lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-from:: AI.REVIEWER] [fd-createdAt:: <текущее время ISO8601>] [fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
     }
   } else {
     lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше; укажи fd-reply на дугу).');
@@ -349,7 +373,8 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     }
     const gate = step.section === 'REVIEW' && gateDue(content, opts.spec);
     const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
-    const user = buildUserPrompt(role, journal, step.section, step.arc.addr, nextL1Number(content, step.section ?? 'ISSUE'));
+    const l1Number = nextL1Number(content, step.section ?? 'ISSUE');
+    const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number);
     const tools = roleTools(opts.spec, role, opts.mcp);
     const allowedTools = new Set((tools ?? []).map((t) => t.name));
     const callTool = opts.mcp !== undefined
@@ -402,13 +427,16 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       callTool,
     });
 
+    // Хост проставляет L1-заголовок (и свойства для CODE) поверх тела от LLM.
+    const entry = `${stampHeader(step.section, role, l1Number, step.arc.addr)}${sectionText.trim()}`;
+
     // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.
     if (opts.dryRun) {
-      result.drySections.push(sectionText.trim());
+      result.drySections.push(entry.trim());
       break;
     }
 
-    journal = `${journal.trimEnd()}\n\n${sectionText.trim()}\n`;
+    journal = `${journal.trimEnd()}\n\n${entry.trim()}\n`;
     // Атомарная запись: tmp + rename — журнал никогда не остаётся полузаписанным.
     const tmpPath = `${chatPath}.tmp`;
     await writeFile(tmpPath, journal);
