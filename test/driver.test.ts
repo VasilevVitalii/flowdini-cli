@@ -15,6 +15,7 @@ import {
   isNotFoundError,
   snapshotDefinitions,
   toolCallVerdict,
+  stripL1Headers,
 } from '../src/driver.js';
 import type { TFdMcpClient } from '../src/mcp.js';
 
@@ -78,6 +79,13 @@ describe('makeLookup', () => {
     const lookup = makeLookup(mcp, 'mssql');
     await expect(lookup('dbo.sp_x')).resolves.toEqual({ exists: null, kind: null });
   });
+  it('трёхчастный obj-path с БД, не совпадающей с connection → бросает (префикс не игнорируем)', async () => {
+    const mcp = mockMcp(() => {
+      throw new Error('не должен вызываться');
+    });
+    const lookup = makeLookup(mcp, 'mssql');
+    await expect(lookup('otherdb.dbo.sp_x')).rejects.toThrow('не совпадает с connection');
+  });
 });
 
 describe('makeGetDefinition', () => {
@@ -116,6 +124,13 @@ describe('makeGetDefinition', () => {
     const mcp = mockMcp(() => JSON.stringify({ ok: true, definitions: [{ definition: '   ' }] }));
     const get = makeGetDefinition(mcp, 'mssql');
     await expect(get('dbo.x')).rejects.toThrow('пустое определение');
+  });
+  it('трёхчастный obj-path с БД, не совпадающей с connection → бросает', async () => {
+    const mcp = mockMcp(() => {
+      throw new Error('не должен вызываться');
+    });
+    const get = makeGetDefinition(mcp, 'mssql');
+    await expect(get('otherdb.dbo.sp_x')).rejects.toThrow('не совпадает с connection');
   });
 });
 
@@ -160,7 +175,7 @@ describe('collectTaskObjects', () => {
 });
 
 describe('snapshotDefinitions', () => {
-  const obj = (objPath: string) => ({ objPath, objKind: 'procedure', objAction: 'edit' as const });
+  const obj = (objPath: string) => ({ objPath, objKind: 'procedure' as const, objAction: 'edit' as const });
 
   it('найденные → в снапшот, ошибок нет', async () => {
     const errors: string[] = [];
@@ -284,6 +299,34 @@ describe('buildCrash', () => {
     const c = buildCrash([]);
     expect(c).toContain('# CRASH 1');
     expect(c).not.toContain('~~~');
+  });
+
+  it('адаптивный fence: серия ~ в ответе AI не закрывает ограду преждевременно', () => {
+    const c = buildCrash(['ошибка'], 'внутри ~~~~ и ещё ~~~~~~');
+    // fence длиннее самой длинной серии ~ (6) → 7 тильд, иначе «~~~~~~» закрыл бы ограду.
+    expect(c).toContain('~~~~~~~\nвнутри ~~~~ и ещё ~~~~~~\n~~~~~~~');
+  });
+});
+
+describe('stripL1Headers', () => {
+  it('срезает L1-заголовки вне fence; ## и тело остаются', () => {
+    const out = stripL1Headers('описание\n# ISSUE 7\n[fd-from:: AI.CODER.JUNIOR]\n\n## BUG 1\nтекст');
+    expect(out).not.toContain('# ISSUE 7');
+    expect(out).toContain('## BUG 1');
+    expect(out).toContain('описание');
+    expect(out).toContain('текст');
+  });
+
+  it('не трогает # внутри ```-fence (SQL-комментарий)', () => {
+    const out = stripL1Headers('```sql\n# это комментарий\nSELECT 1\n```\nпосле');
+    expect(out).toContain('# это комментарий');
+    expect(out).toContain('после');
+  });
+
+  it('не трогает # внутри ~~~-fence, но срезает снаружи', () => {
+    const out = stripL1Headers('~~~\n# внутри\n~~~\n# снаружи');
+    expect(out).toContain('# внутри');
+    expect(out).not.toContain('# снаружи');
   });
 });
 

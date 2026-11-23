@@ -259,21 +259,63 @@ export function stampFixItem(
   return `${stampHeader('FIX', role, l1Number, arcAddr, now)}${inner}`;
 }
 
+/** Длина тильда-fence для CRASH: строго длиннее любой серии `~` в ограждаемом
+ *  тексте — иначе `~~~` (или длиннее) внутри ответа модели преждевременно закроет
+ *  внешнюю ограду и часть сырого ответа снова попадёт в индексацию журнала. */
+function crashFence(...parts: string[]): string {
+  let maxRun = 0;
+  for (const p of parts) {
+    for (const m of p.matchAll(/~+/g)) {
+      if (m[0].length > maxRun) maxRun = m[0].length;
+    }
+  }
+  return '~'.repeat(Math.max(3, maxRun + 1));
+}
+
 /** Терминальный маркер аварии `# CRASH 1` (без свойств, хост не притворяется ролью):
- *  ошибки + сырой ответ AI. Обе части — в `~~~`-fence: `taskCheck` не проверяет
- *  ссылки внутри fence (`stripFences`), а `~~~` не конфликтует с ```-блоками SQL,
- *  которые AI пишет в CODE/FIX. */
+ *  ошибки + сырой ответ AI. Обе части — в тильда-fence адаптивной длины: `taskCheck`
+ *  не проверяет ссылки внутри fence (`stripFences`), а `~` не конфликтует с ```-блоками
+ *  SQL, которые AI пишет в CODE/FIX. */
 export function buildCrash(errors: string[], rawAnswer?: string): string {
   const out = [
     '# CRASH 1',
     '',
     'Процесс остановлен из-за непредвиденной ошибки. Разбери, исправь, удали этот раздел и перезапусти.',
   ];
+  const body = rawAnswer !== undefined && rawAnswer.trim() !== '' ? rawAnswer.trimEnd() : '';
+  const fence = crashFence(...errors, body);
   if (errors.length > 0) {
-    out.push('', 'Ошибки:', '', '~~~', ...errors, '~~~');
+    out.push('', 'Ошибки:', '', fence, ...errors, fence);
   }
-  if (rawAnswer !== undefined && rawAnswer.trim() !== '') {
-    out.push('', 'Ответ AI, породивший ошибки:', '', '~~~', rawAnswer.trimEnd(), '~~~');
+  if (body !== '') {
+    out.push('', 'Ответ AI, породивший ошибки:', '', fence, body, fence);
+  }
+  return out.join('\n');
+}
+
+/** Убрать L1-заголовки (`# …`) из ответа модели вне ```/~~~ fence. Для non-null секций
+ *  (CODE/REVIEW/FIX) L1 проставляет хост: `# ISSUE 7` в теле модели — инъекция, которая
+ *  иначе стала бы настоящим топиком и открыла дуги. `##` и глубже оставляем (их в
+ *  REVIEW/bulk-FIX пишет сама модель; заголовки в CODE/FIX-item ловит `taskCheck`). */
+export function stripL1Headers(text: string): string {
+  const lines = text.split('\n');
+  let fence: '`' | '~' | null = null;
+  const out: string[] = [];
+  for (const line of lines) {
+    const m = /^\s*(```+|~~~+)/.exec(line);
+    if (m !== null) {
+      const marker = m[1][0] === '`' ? ('`' as const) : ('~' as const);
+      if (fence === null) fence = marker;
+      else if (fence === marker) fence = null;
+      // иной маркер внутри открытого fence — контент, состояние не меняем.
+      out.push(line);
+      continue;
+    }
+    if (fence === null && /^#\s/.test(line)) {
+      out.push('');
+      continue;
+    }
+    out.push(line);
   }
   return out.join('\n');
 }
@@ -352,12 +394,15 @@ export function isNotFoundError(e: unknown): boolean {
 
 const DB_KINDS = ['procedure', 'function', 'view'] as const;
 
-/** obj-path: db.schema.name — БД задаёт `connection`, берём последние две части (schema, name). */
-function splitObjPath(objPath: string): { name: string; schema: string | undefined } {
+/** obj-path: `schema.name` или `db.schema.name` — БД задаёт `connection`, берём последние
+ *  две части (schema, name). Префикс из 1+ сегментов (имя БД) обязан совпадать с
+ *  `connection`: иначе объект адресован не в ту базу. */
+function splitObjPath(objPath: string): { name: string; schema: string | undefined; dbPrefix: string | undefined } {
   const parts = objPath.split('.');
   return {
     name: parts[parts.length - 1],
     schema: parts.length >= 2 ? parts[parts.length - 2] : undefined,
+    dbPrefix: parts.length >= 3 ? parts.slice(0, parts.length - 2).join('.') : undefined,
   };
 }
 
@@ -388,13 +433,18 @@ async function probeDefinition(
   }
   const parsed = JSON.parse(text) as { ok?: boolean; definitions?: Array<{ definition?: string }> };
   if (parsed.ok !== true) return 'okfalse';
-  if ((parsed.definitions?.length ?? 0) === 0) return 'notfound';
-  return { definitions: parsed.definitions! };
+  // `ok:true` без массива `definitions` — нарушение протокола, а не «объекта нет».
+  if (!Array.isArray(parsed.definitions)) return 'okfalse';
+  if (parsed.definitions.length === 0) return 'notfound';
+  return { definitions: parsed.definitions };
 }
 
 export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
-    const { name, schema } = splitObjPath(objPath);
+    const { name, schema, dbPrefix } = splitObjPath(objPath);
+    if (dbPrefix !== undefined && dbPrefix !== connection) {
+      throw new Error(`obj-path ${objPath}: база "${dbPrefix}" не совпадает с connection "${connection}"`);
+    }
     for (const kind of DB_KINDS) {
       let probe: TProbe;
       try {
@@ -412,7 +462,10 @@ export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
 
 export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGetDefinition {
   return async (objPath: string) => {
-    const { name, schema } = splitObjPath(objPath);
+    const { name, schema, dbPrefix } = splitObjPath(objPath);
+    if (dbPrefix !== undefined && dbPrefix !== connection) {
+      throw new Error(`obj-path ${objPath}: база "${dbPrefix}" не совпадает с connection "${connection}"`);
+    }
     for (const kind of DB_KINDS) {
       let probe: TProbe;
       try {
@@ -505,11 +558,29 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const vaultRoot = opts.vaultRoot ?? opts.taskDir;
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
+  // `run()` — публичный API: лимит шагов обязан быть целым >= 1, иначе цикл ведёт
+  // себя недетерминированно (дробный maxSteps даёт лишний проход).
+  if (!Number.isInteger(maxSteps) || maxSteps < 1) {
+    throw new Error(`maxSteps должен быть целым >= 1, получено ${JSON.stringify(maxSteps)}`);
+  }
   const fixMode = opts.spec.fixMode ?? 'item';
   const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], warnings: [], hitMaxSteps: false, drySections: [], dryWarnings: [] };
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
+
+  // C4: пред-проверка исходного состояния — не начинаем писать поверх уже битого
+  // журнала (объектная часть issue-app.md и структура chat.md проверяются до агента).
+  let initialErrs: Array<{ relativeFileName: string; error: string }>;
+  try {
+    initialErrs = await taskCheck(opts.taskDir, { exclude: ['issue-draft.md', 'issue-dom.md', 'knowledge-candidates.md'], vaultRoot });
+  } catch (e) {
+    initialErrs = [{ relativeFileName: CHAT_FILE, error: `taskCheck failed: ${String((e as Error)?.message ?? e)}` }];
+  }
+  if (initialErrs.length > 0) {
+    result.errors.push(...initialErrs.map((e) => `${e.relativeFileName}: ${e.error}`));
+    return result;
+  }
 
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
@@ -529,6 +600,19 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const role = step.section === 'CODE' ? 'AI.CODER.JUNIOR'
       : step.section === 'FIX' ? 'AI.CODER.SENIOR'
       : addressedRole;
+    // Исполнитель обязан покрывать адресата дуги — иначе ответ не закроет дугу и цикл
+    // упрётся в maxSteps. Секции CODE/FIX назначают JUNIOR/SENIOR: если ISSUE адресован
+    // конкретному INSTANCE (напр. AI.CODER.SENIOR), которого исполнитель не покрывает, —
+    // детерминированный стоп с подсказкой, а не тихий цикл.
+    if (!roleCovers(addressedRole, role)) {
+      result.errors.push(
+        `роль ${role} не покрывает адресата дуги ${addressedRole}: адресуйте ISSUE роли, которую покрывает исполнитель (${step.section ?? 'свободный раздел'})`,
+      );
+      break;
+    }
+    // Единые часы на весь шаг: фикс-справка и штампы используют один `now` (детерминизм).
+    const stepNow = new Date();
+    const now = () => stepNow;
     const brief = roleBrief(opts.spec, role, content);
     const model = brief.spec.model;
     if (model === undefined) {
@@ -545,12 +629,15 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const l1Number = nextL1Number(content, step.section ?? 'ISSUE');
     const reference =
       step.section === 'FIX' && fixMode === 'item' && opts.spec.fixReference === true
-        ? fixReference(content, step.arc.addr)
+        ? fixReference(content, step.arc.addr, now)
         : undefined;
     // Accept-политика: детерминированный accept-статус дуги-ответа человека
-    // (`ANSWERS n#A m`). `null` (не ответ человека) → undefined в opts.
+    // (`ANSWERS n#A m`). Применяется только на маршруте аналитика (ANSWERS адресован
+    // AI.ANALYST): иначе accept-разбор не валиден. `null` (не ответ человека) → undefined.
     const acceptAnswer =
-      step.section === null ? acceptOf(content, step.arc.addr) : null;
+      step.section === null && roleCovers('AI.ANALYST', role)
+        ? acceptOf(content, step.arc.addr)
+        : null;
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number, {
       fixMode,
       fixReference: reference,
@@ -602,13 +689,20 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
         if (!opts.dryRun) {
           const baselineManifest = await readIfExists(join(opts.taskDir, 'snapshots', 'baseline', 'manifest.json'));
           if (baselineManifest === null) {
+            // C5: ошибки baseline собираем отдельно — манифест пишем только при полном
+            // снимке, иначе следующий запуск сочтёт неполный baseline готовым и не доснимет.
+            const baselineErrors: string[] = [];
             const existing: TFdDbObject[] = [];
             for (const o of plan) {
               const l = await makeLookup(opts.mcp, connection)(o.objPath);
               if (l.exists === true) existing.push(o);
-              else if (l.exists === null) result.errors.push(`baseline: cannot verify ${o.objPath}`);
+              else if (l.exists === null) baselineErrors.push(`baseline: cannot verify ${o.objPath}`);
             }
-            const defs = await snapshotDefinitions(existing, makeGetDefinition(opts.mcp, connection), result.errors);
+            const defs = await snapshotDefinitions(existing, makeGetDefinition(opts.mcp, connection), baselineErrors);
+            if (baselineErrors.length > 0) {
+              result.errors.push(...baselineErrors);
+              break;
+            }
             await captureSnapshot(opts.taskDir, 'baseline', defs);
           }
         }
@@ -644,16 +738,18 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // Хост проставляет L1-заголовок (и свойства для CODE), затем перезаписывает
     // детерминированные fd-from/fd-createdAt на топиках LLM (подзаголовки REVIEW/FIX
     // и L1+подзаголовки в null-кейсе). CODE — только тело без заголовков: пост-обработку
-    // пропускаем, чтобы не трогать тело (в т.ч. fenced SQL). Единый `now` на весь раздел.
-    const stepNow = new Date();
-    const now = () => stepNow;
+    // пропускаем, чтобы не трогать тело (в т.ч. fenced SQL).
+    // C3: для non-null секций срезаем L1-заголовки из ответа модели (вне fence) — хост
+    // ставит L1 сам, `# ISSUE 7` в теле модели не должен стать топиком. Null-кейс модель
+    // пишет L1 сама — не трогаем.
+    const sanitized = step.section !== null ? stripL1Headers(sectionText) : sectionText;
     let entry: string;
     if (step.section === 'FIX' && fixMode === 'item') {
-      entry = stampFixItem(sectionText.trim(), role, l1Number, step.arc.addr, now);
+      entry = stampFixItem(sanitized.trim(), role, l1Number, step.arc.addr, now);
     } else if (step.section === 'CODE') {
-      entry = `${stampHeader('CODE', role, l1Number, step.arc.addr, now)}${sectionText.trim()}`;
+      entry = `${stampHeader('CODE', role, l1Number, step.arc.addr, now)}${sanitized.trim()}`;
     } else {
-      entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${stampRoleFields(sectionText, role, now).trim()}`;
+      entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${stampRoleFields(sanitized, role, now).trim()}`;
     }
 
     // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.
@@ -668,7 +764,6 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     await writeFile(tmpPath, candidate);
     await rename(tmpPath, chatPath);
     content = textToStructure(candidate, true);
-    result.steps++;
 
     let errs: Array<{ relativeFileName: string; error: string }>;
     try {
@@ -676,14 +771,29 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     } catch (e) {
       errs = [{ relativeFileName: CHAT_FILE, error: `taskCheck failed: ${String((e as Error)?.message ?? e)}` }];
     }
+    // P0: при превышении reviewLimit гейт обязателен — этот REVIEW обязан начинаться
+    // с `## Q` к HUMAN.CODER (taskCheck проверяет порядок/адресат, но не наличие).
+    if (gate && step.section === 'REVIEW') {
+      const hasGateQ = content.itemList.some(
+        (it) => it.topic.level1?.title === 'REVIEW' && it.topic.level1.idx === l1Number && it.topic.level2?.title === 'Q',
+      );
+      if (!hasGateQ) {
+        errs.push({ relativeFileName: CHAT_FILE, error: `gate due: REVIEW ${l1Number} должен начинаться с ## Q к HUMAN.CODER` });
+      }
+    }
     if (errs.length > 0) {
       // Битый раздел не оставляем: откат к состоянию ДО ответа роли + # CRASH.
       const crashBody = buildCrash(errs.map((e) => `${e.relativeFileName}: ${e.error}`), sectionText);
-      await writeFile(tmpPath, `${journal.trimEnd()}\n\n${crashBody}\n`);
+      const rolledBack = `${journal.trimEnd()}\n\n${crashBody}\n`;
+      await writeFile(tmpPath, rolledBack);
       await rename(tmpPath, chatPath);
-      result.errors = errs.map((e) => `${e.relativeFileName}: ${e.error}`);
+      // Не затираем ранее накопленные ошибки (baseline/snapshot) и отражаем фактическое
+      // состояние диска — иначе нижний knowledge-candidates увидит DONE из отвергнутого кандидата.
+      result.errors.push(...errs.map((e) => `${e.relativeFileName}: ${e.error}`));
+      content = textToStructure(rolledBack, true);
       break;
     }
+    result.steps++;
     journal = candidate;
 
     // Снапшот после CODE/FIX: определения объектов → captureSnapshot.

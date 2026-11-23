@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // CLI автономного рантайма flowdini: `flowdini run <taskDir> [flags]`.
+import { join, resolve } from 'node:path';
 import { readSpec, validateSpec } from 'flowdini-engine';
 import { loadProvidersConfig } from './config.js';
 import { startMcp } from './mcp.js';
@@ -67,11 +68,7 @@ async function main(): Promise<void> {
   }
   const providers = loadProvidersConfig(providersPath);
 
-  const vvdbDir = f['--vvdb'];
-  const mcp = vvdbDir !== undefined
-    ? await startMcp(vvdbDir, f['--vvdb-config'] ?? `${vvdbDir}/.connect.json`)
-    : undefined;
-
+  // Проверка флагов до подъёма MCP: не плодим дочерний процесс при невалидном --max-steps.
   let maxSteps = 20;
   if (f['--max-steps'] !== undefined) {
     const n = Number(f['--max-steps']);
@@ -82,6 +79,14 @@ async function main(): Promise<void> {
     maxSteps = n;
   }
 
+  // --vvdb: каталог vv-db-mcp. Резолвим в абсолютный путь, чтобы он не задваивался как
+  // cwd дочернего процесса и как префикс дефолтного пути конфига.
+  const vvdbDir = f['--vvdb'] !== undefined ? resolve(f['--vvdb']) : undefined;
+  const mcp = vvdbDir !== undefined
+    ? await startMcp(vvdbDir, f['--vvdb-config'] !== undefined ? resolve(f['--vvdb-config']) : join(vvdbDir, '.connect.json'))
+    : undefined;
+
+  const dryRun = f['--dry-run'] === 'true';
   try {
     const res = await run({
       taskDir,
@@ -91,16 +96,24 @@ async function main(): Promise<void> {
       vaultRoot: f['--vault-root'],
       connection: f['--connection'],
       maxSteps,
-      dryRun: f['--dry-run'] === 'true',
+      dryRun,
     });
-    if (res.drySections.length > 0) {
-      console.log('=== dry-run: раздел, который агент написал бы ===');
-      for (const s of res.drySections) console.log(s);
+    if (dryRun) {
+      if (res.drySections.length > 0) {
+        console.log('=== dry-run: раздел, который агент написал бы ===');
+        for (const s of res.drySections) console.log(s);
+        console.log('=== конец dry-run (журнал и БД не изменены) ===');
+      }
+      // Сбой/предупреждения в dry-run тоже видны: иначе авария молча падает в «открытых дуг нет».
       if (res.dryWarnings.length > 0) {
         console.log('=== dry-run: предупреждения ===');
         for (const w of res.dryWarnings) console.log(`  ⚠ ${w}`);
       }
-      console.log('=== конец dry-run (журнал и БД не изменены) ===');
+      if (res.errors.length > 0) {
+        console.log('ошибки:');
+        for (const e of res.errors) console.log(`  - ${e}`);
+        process.exitCode = 1;
+      }
       return;
     }
     if (res.steps > 0) {

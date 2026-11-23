@@ -29,7 +29,15 @@ export async function runRole(opts: TFdRunRoleOpts): Promise<string> {
       for (const tc of msg.tool_calls) {
         let result: string;
         try {
-          const args = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
+          let args: Record<string, unknown> = {};
+          if (tc.function.arguments) {
+            const parsed = JSON.parse(tc.function.arguments) as unknown;
+            // arguments обязан быть JSON-объектом; null/массив/примитив — нарушение формы.
+            if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+              throw new Error(`LLM: arguments инструмента ${tc.function.name} не объект`);
+            }
+            args = parsed as Record<string, unknown>;
+          }
           result = await opts.callTool(tc.function.name, args);
         } catch (e) {
           result = `ERROR: ${(e as Error).message}`;
