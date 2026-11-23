@@ -9,6 +9,7 @@ import {
   buildUserPrompt,
   nowStamp,
   stampHeader,
+  stampRoleFields,
   buildCrash,
   isNotFoundError,
   snapshotDefinitions,
@@ -245,5 +246,44 @@ describe('buildCrash', () => {
     const c = buildCrash([]);
     expect(c).toContain('# CRASH 1');
     expect(c).not.toContain('~~~');
+  });
+});
+
+describe('stampRoleFields', () => {
+  const now = () => new Date('2026-11-23T10:20:30.456Z');
+
+  it('REVIEW: добавляет fd-from/fd-createdAt, сохраняет fd-to/fd-reply, каноничный порядок', () => {
+    const body = '## BUG 1\n[fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#CODE 1]]]\n\nописание бага';
+    const out = stampRoleFields(body, 'AI.REVIEWER', now);
+    expect(out).toBe(
+      '## BUG 1\n[fd-from:: AI.REVIEWER] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#CODE 1]]]\n\nописание бага',
+    );
+  });
+
+  it('перезаписывает неверные fd-from/fd-createdAt, написанные LLM', () => {
+    const body = '## BUG 1\n[fd-from:: AI.WRITER] [fd-createdAt:: 2000-01-01T00:00:00Z] [fd-to:: AI.CODER.SENIOR]\n\nбаг';
+    const out = stampRoleFields(body, 'AI.REVIEWER', now);
+    expect(out).toContain('[fd-from:: AI.REVIEWER]');
+    expect(out).toContain('[fd-createdAt:: 2026-11-23T10:20:30Z]');
+    expect(out).not.toContain('AI.WRITER');
+    expect(out).not.toContain('2000-01-01');
+  });
+
+  it('контейнер без свойств и тела не получает fd-from/fd-createdAt', () => {
+    const out = stampRoleFields('# ANSWERS 1', 'AI.ANALYST', now);
+    expect(out).toBe('# ANSWERS 1');
+  });
+
+  it('null-кейс: L1 (fd-reply) и вложенный ## Q (fd-to) оба получают поля', () => {
+    const body = '# QUESTIONS 1\n[fd-reply:: [[#ISSUE 1]]]\n\n## Q 1\n[fd-to:: HUMAN.ANALYST]\n\nвопрос';
+    const out = stampRoleFields(body, 'AI.ANALYST', now);
+    expect(out).toBe(
+      '# QUESTIONS 1\n[fd-from:: AI.ANALYST] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-reply:: [[#ISSUE 1]]]\n\n## Q 1\n[fd-from:: AI.ANALYST] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: HUMAN.ANALYST]\n\nвопрос',
+    );
+  });
+
+  it('пустой текст возвращается как есть', () => {
+    expect(stampRoleFields('', 'AI.REVIEWER', now)).toBe('');
+    expect(stampRoleFields('  \n', 'AI.REVIEWER', now)).toBe('  \n');
   });
 });

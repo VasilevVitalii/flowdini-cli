@@ -4,6 +4,7 @@ import { join, resolve, sep } from 'node:path';
 import { textToStructure } from 'flowdini-spec';
 import type { TFdContent } from 'flowdini-spec';
 import {
+  contentPretty,
   nextStep,
   roleBrief,
   gateDue,
@@ -196,6 +197,35 @@ export function stampHeader(
   return `${head}\n\n`;
 }
 
+/**
+ * Пост-обработка секции от LLM: ХОСТ перезаписывает детерминированные свойства
+ * `fd-from` (= роль) и `fd-createdAt` (= now) на каждом топике-сообщении
+ * (есть тело или `fd-from`/`fd-to`/`fd-reply`). `fd-to`/`fd-reply` (зависят от
+ * контента/домена) остаются как написал LLM. Возвращает каноничный текст
+ * секции через `contentPretty` движка.
+ */
+export function stampRoleFields(
+  text: string,
+  role: string,
+  now: () => Date = () => new Date(),
+): string {
+  if (text.trim() === '') return text;
+  const content = textToStructure(text, true);
+  for (const item of content.itemList) {
+    const t = item.topic;
+    const isMessage =
+      item.text !== null ||
+      t.inlineList.some((f) => f.param === 'fd-from' || f.param === 'fd-to' || f.param === 'fd-reply');
+    if (!isMessage) continue;
+    t.inlineList = t.inlineList.filter(
+      (f) => f.source !== 'topic' || (f.param !== 'fd-from' && f.param !== 'fd-createdAt'),
+    );
+    t.inlineList.push({ param: 'fd-from', valueList: [role], source: 'topic' });
+    t.inlineList.push({ param: 'fd-createdAt', valueList: [nowStamp(now)], source: 'topic' });
+  }
+  return contentPretty(content, now);
+}
+
 /** Терминальный маркер аварии `# CRASH 1` (без свойств, хост не притворяется ролью):
  *  ошибки + сырой ответ AI. Обе части — в `~~~`-fence: `taskCheck` не проверяет
  *  ссылки внутри fence (`stripFences`), а `~~~` не конфликтует с ```-блоками SQL,
@@ -234,12 +264,12 @@ export function buildUserPrompt(
     if (section === 'CODE') {
       lines.push('Напиши только тело раздела (обычные абзацы/списки, без заголовков).');
     } else if (section === 'FIX') {
-      lines.push('Пиши вложенные заголовки: под каждое замечание из ревью — «## {ИМЯ} N» (тот же BUG/RISK/OTHER и номер, что в ревью) с телом и свойствами `[fd-from:: AI.CODER.SENIOR] [fd-createdAt:: <текущее время ISO8601>] [fd-to:: AI.REVIEWER] [fd-reply:: [[#<пункт ревью>]]]`.');
+      lines.push('Пиши вложенные заголовки: под каждое замечание из ревью — «## {ИМЯ} N» (тот же BUG/RISK/OTHER и номер, что в ревью) с телом и свойствами `[fd-to:: AI.REVIEWER] [fd-reply:: [[#<пункт ревью>]]]`. Поля `fd-from`/`fd-createdAt` НЕ пиши — их проставляет хост.');
     } else if (section === 'REVIEW') {
-      lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-from:: AI.REVIEWER] [fd-createdAt:: <текущее время ISO8601>] [fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
+      lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Поля fd-from/fd-createdAt НЕ пиши — их проставляет хост. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
     }
   } else {
-    lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше; укажи fd-reply на дугу).');
+    lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше). Пиши заголовок раздела и свойства fd-to/fd-reply (на дугу); поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   }
   return lines.join('\n');
 }
@@ -463,8 +493,15 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       break;
     }
 
-    // Хост проставляет L1-заголовок (и свойства для CODE) поверх тела от LLM.
-    const entry = `${stampHeader(step.section, role, l1Number, step.arc.addr)}${sectionText.trim()}`;
+    // Хост проставляет L1-заголовок (и свойства для CODE), затем перезаписывает
+    // детерминированные fd-from/fd-createdAt на топиках LLM (подзаголовки REVIEW/FIX
+    // и L1+подзаголовки в null-кейсе). CODE — только тело без заголовков: пост-обработку
+    // пропускаем, чтобы не трогать тело (в т.ч. fenced SQL). Единый `now` на весь раздел.
+    const stepNow = new Date();
+    const now = () => stepNow;
+    const body =
+      step.section === 'CODE' ? sectionText.trim() : stampRoleFields(sectionText, role, now).trim();
+    const entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${body}`;
 
     // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.
     if (opts.dryRun) {
