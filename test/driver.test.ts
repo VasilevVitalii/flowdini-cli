@@ -200,6 +200,18 @@ describe('buildUserPrompt', () => {
     expect(p).toContain('fd-to:: AI.REVIEWER');
     expect(p).toContain('проставляет хост');
   });
+
+  it('accept-ответ НЕ `+` (отказ) — НЕ велит писать DONE от AI, а вернуть человеку', () => {
+    const p = buildUserPrompt('AI.ANALYST', 'журнал', null, 'ANSWERS 1#A 1', 2, { acceptAnswer: false });
+    expect(p).toContain('отказ → QUESTIONS к человеку');
+    expect(p).not.toContain('отказ → DONE');
+    expect(p).toContain('DONE поставит сам человек');
+  });
+
+  it('accept-ответ `+` — передать задание дальше (ISSUE)', () => {
+    const p = buildUserPrompt('AI.ANALYST', 'журнал', null, 'ANSWERS 1#A 1', 2, { acceptAnswer: true });
+    expect(p).toContain('Передай задание дальше (ISSUE)');
+  });
 });
 
 describe('nowStamp', () => {
@@ -219,8 +231,10 @@ describe('stampHeader', () => {
     );
   });
 
-  it('REVIEW/FIX — заголовок-контейнер без свойств', () => {
-    expect(stampHeader('REVIEW', 'AI.REVIEWER', 1, 'CODE 1', now)).toBe('# REVIEW 1\n\n');
+  it('REVIEW — закрывает дугу детерминированно (fd-from + fd-reply), FIX — контейнер', () => {
+    expect(stampHeader('REVIEW', 'AI.REVIEWER', 1, 'CODE 1', now)).toBe(
+      '# REVIEW 1\n[fd-from:: AI.REVIEWER] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-reply:: [[#CODE 1]]]\n\n',
+    );
     expect(stampHeader('FIX', 'AI.CODER.SENIOR', 1, 'REVIEW 1#BUG 1', now)).toBe('# FIX 1\n\n');
   });
 

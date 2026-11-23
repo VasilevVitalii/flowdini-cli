@@ -135,11 +135,10 @@ async function buildSystemPrompt(
   const vaultReal = await realpath(vaultRoot).catch(() => null);
   for (const f of vault) {
     const p = resolve(vaultRoot, f);
-    if (vaultReal !== null) {
-      const rp = await realpath(p).catch(() => null);
-      if (rp === null) continue; // файла нет
-      if (rp !== vaultReal && !rp.startsWith(vaultReal + sep)) continue; // вне vault
-    }
+    if (vaultReal === null) continue; // vaultRoot не резолвится — vault недоступен, файл не читаем (fail-closed)
+    const rp = await realpath(p).catch(() => null);
+    if (rp === null) continue; // файла нет
+    if (rp !== vaultReal && !rp.startsWith(vaultReal + sep)) continue; // вне vault
     const text = await readIfExists(p);
     if (text !== null) {
       lines.push(`Контекст из «${f}»:`);
@@ -183,7 +182,9 @@ export function nowStamp(now: () => Date): string {
 
 /** L1-заголовок раздела, который проставляет ХОСТ (не LLM), по канону:
  *  - `CODE` — заголовок + свойства (`fd-from`, `fd-createdAt`, `fd-to:: AI.REVIEWER`, `fd-reply`);
- *  - `REVIEW`/`FIX` — заголовок-контейнер без свойств (свойства на вложенных `##`);
+ *  - `REVIEW` — заголовок + `fd-from`/`fd-createdAt`/`fd-reply` (детерминированно закрывает
+ *    дугу CODE/FIX → AI.REVIEWER; подзаголовки `## BUG/RISK/OTHER` — отдельно);
+ *  - `FIX` — заголовок-контейнер без свойств (свойства на вложенных `##`);
  *  - `null` (аналитик сам решает) — пусто: хост не знает раздела, LLM пишет всё.
  *  `now` — источник времени (инъекция для тестов). */
 export function stampHeader(
@@ -197,6 +198,11 @@ export function stampHeader(
   const head = `# ${section} ${l1Number}`;
   if (section === 'CODE') {
     return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]\n\n`;
+  }
+  if (section === 'REVIEW') {
+    // REVIEW закрывает дугу CODE/FIX → AI.REVIEWER детерминированно (fd-from + fd-reply):
+    // иначе «замечаний нет» оставляет дугу открытой и nextStep зацикливает REVIEW.
+    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-reply:: [[#${arcAddr}]]]\n\n`;
   }
   return `${head}\n\n`;
 }
@@ -326,7 +332,7 @@ export function buildUserPrompt(
     if (opts.acceptAnswer) {
       lines.push('Ответ человека на эту дугу — ровно `+` (детерминированный accept). Передай задание дальше (ISSUE), не переспрашивай.');
     } else {
-      lines.push('Ответ человека на эту дугу — НЕ `+`. Разбери его: замечания/правки → новая итерация QUESTIONS; фактическое согласие («да», «ок») → передай дальше (ISSUE); отказ → DONE. Accept — только ровно `+`.');
+      lines.push('Ответ человека на эту дугу — НЕ `+`. Разбери его: замечания/правки → новая итерация QUESTIONS; фактическое согласие («да», «ок») → передай дальше (ISSUE); отказ → QUESTIONS к человеку (перескажи отказ; DONE поставит сам человек или даст новый ISSUE). Accept — только ровно `+`.');
     }
     lines.push('Раздел и свойства fd-to/fd-reply (на дуги-ответы) пиши сам; поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   } else {
@@ -581,6 +587,11 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       });
     } catch (err) {
       const msg = `${role}: ${err instanceof Error ? err.message : String(err)}`;
+      if (opts.dryRun) {
+        // dry-run не пишет журнал: сбой роли фиксируем в dryWarnings, не в # CRASH.
+        result.dryWarnings.push(msg);
+        break;
+      }
       const tmpPath = `${chatPath}.tmp`;
       await writeFile(tmpPath, `${journal.trimEnd()}\n\n${buildCrash([msg])}\n`);
       await rename(tmpPath, chatPath);
@@ -617,7 +628,12 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     content = textToStructure(candidate, true);
     result.steps++;
 
-    const errs = await taskCheck(opts.taskDir);
+    let errs: Array<{ relativeFileName: string; error: string }>;
+    try {
+      errs = await taskCheck(opts.taskDir, { exclude: ['issue-draft.md', 'issue-dom.md', 'knowledge-candidates.md'], vaultRoot });
+    } catch (e) {
+      errs = [{ relativeFileName: CHAT_FILE, error: `taskCheck failed: ${String((e as Error)?.message ?? e)}` }];
+    }
     if (errs.length > 0) {
       // Битый раздел не оставляем: откат к состоянию ДО ответа роли + # CRASH.
       const crashBody = buildCrash(errs.map((e) => `${e.relativeFileName}: ${e.error}`), sectionText);
