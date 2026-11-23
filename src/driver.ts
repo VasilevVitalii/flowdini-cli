@@ -17,6 +17,7 @@ import {
   validateDbObject,
   captureSnapshot,
   fixReference,
+  acceptOf,
 } from 'flowdini-engine';
 import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec, TFdDbObject } from 'flowdini-engine';
 import type { TFdProvidersConfig } from './config.js';
@@ -274,6 +275,9 @@ export interface TFdPromptOpts {
   fixMode?: 'bulk' | 'item';
   /** Текст справки (предыдущие пункты REVIEW + фиксы) при `fixMode: item`. */
   fixReference?: string;
+  /** Детерминированный accept-статус дуги-ответа человека (`ANSWERS n#A m`):
+   *  `true` — ответ ровно `+`; `false` — иной ответ. `undefined` — дуга не ответ человека. */
+  acceptAnswer?: boolean;
 }
 
 export function buildUserPrompt(
@@ -315,6 +319,14 @@ export function buildUserPrompt(
     } else if (section === 'REVIEW') {
       lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Поля fd-from/fd-createdAt НЕ пиши — их проставляет хост. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
     }
+  } else if (opts?.acceptAnswer !== undefined) {
+    // Разбор ответа человека на вопрос (accept-политика канона): accept — только ровно `+`.
+    if (opts.acceptAnswer) {
+      lines.push('Ответ человека на эту дугу — ровно `+` (детерминированный accept). Передай задание дальше (ISSUE), не переспрашивай.');
+    } else {
+      lines.push('Ответ человека на эту дугу — НЕ `+`. Разбери его: замечания/правки → новая итерация QUESTIONS; фактическое согласие («да», «ок») → передай дальше (ISSUE); отказ → DONE. Accept — только ровно `+`.');
+    }
+    lines.push('Раздел и свойства fd-to/fd-reply (на дуги-ответы) пиши сам; поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   } else {
     lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше). Пиши заголовок раздела и свойства fd-to/fd-reply (на дугу); поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   }
@@ -482,9 +494,14 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       step.section === 'FIX' && fixMode === 'item' && opts.spec.fixReference === true
         ? fixReference(content, step.arc.addr)
         : undefined;
+    // Accept-политика: детерминированный accept-статус дуги-ответа человека
+    // (`ANSWERS n#A m`). `null` (не ответ человека) → undefined в opts.
+    const acceptAnswer =
+      step.section === null ? acceptOf(content, step.arc.addr) : null;
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number, {
       fixMode,
       fixReference: reference,
+      acceptAnswer: acceptAnswer ?? undefined,
     });
     const tools = roleTools(opts.spec, role, opts.mcp);
     const allowedTools = new Set((tools ?? []).map((t) => t.name));

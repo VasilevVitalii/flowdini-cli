@@ -338,3 +338,27 @@ describe('buildUserPrompt: fixMode/item', () => {
     expect(p).not.toContain('Справка');
   });
 });
+
+describe('buildUserPrompt: accept-политика', () => {
+  const journal = '# ANSWERS 1\n\n## A 1\n[fd-from:: HUMAN.ANALYST]\n\n+\n';
+
+  it('accept (`+`) — «передай дальше», не «разбери»', () => {
+    const p = buildUserPrompt('AI.ANALYST', journal, null, 'ANSWERS 1#A 1', 1, { acceptAnswer: true });
+    expect(p).toContain('детерминированный accept');
+    expect(p).toContain('Передай задание дальше');
+    expect(p).not.toContain('Разбери его');
+  });
+
+  it('не accept — «разбери», правило «только `+`»', () => {
+    const p = buildUserPrompt('AI.ANALYST', journal, null, 'ANSWERS 1#A 1', 1, { acceptAnswer: false });
+    expect(p).toContain('Разбери его');
+    expect(p).toContain('Accept — только ровно `+`');
+    expect(p).not.toContain('детерминированный accept');
+  });
+
+  it('без acceptAnswer (ISSUE к аналитику) — старая инструкция', () => {
+    const p = buildUserPrompt('AI.ANALYST', journal, null, 'ISSUE 1', 1);
+    expect(p).toContain('Раздел выбери сам');
+    expect(p).not.toContain('accept');
+  });
+});
