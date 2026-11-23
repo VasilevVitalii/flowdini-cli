@@ -1,6 +1,11 @@
 // MCP-клиент к vv-db-mcp (stdio). Без лога вызовов (решение владельца, 2026-11-22).
+import { createRequire } from 'node:module';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+
+// Версия MCP-клиента = версия flowdini-cli (единый источник — package.json).
+const require = createRequire(import.meta.url);
+const { version: cliVersion } = require('../package.json') as { version: string };
 
 export interface TFdMcpTool {
   name: string;
@@ -16,8 +21,9 @@ export interface TFdMcpClient {
 
 /** Поднять vv-db-mcp как stdio-подпроцесс и отдать клиент. `vvdbDir` — каталог vv-db-mcp. */
 export async function startMcp(vvdbDir: string, configPath: string): Promise<TFdMcpClient> {
-  const client = new Client({ name: 'flowdini', version: '0.1.0' });
+  const client = new Client({ name: 'flowdini', version: cliVersion });
   const transport = new StdioClientTransport({
+    // `dist/cli.js` — входная точка vv-db-mcp (фиксированный stdio-таргет).
     command: 'node',
     args: ['dist/cli.js', '--config', configPath],
     cwd: vvdbDir,

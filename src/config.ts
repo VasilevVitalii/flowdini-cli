@@ -30,6 +30,9 @@ export function parseProvidersConfig(text: string): TFdProvidersConfig {
   }
   const cfg: TFdProvidersConfig = { providers: providers as Record<string, TFdProviderConfig> };
   for (const [name, p] of Object.entries(cfg.providers)) {
+    if (typeof p !== 'object' || p === null || Array.isArray(p)) {
+      throw new Error(`providers.${name}: провайдер должен быть объектом`);
+    }
     if (typeof p.baseUrl !== 'string' || p.baseUrl === '') {
       throw new Error(`providers.${name}.baseUrl: обязателен`);
     }
@@ -38,6 +41,11 @@ export function parseProvidersConfig(text: string): TFdProvidersConfig {
     }
     if (!Array.isArray(p.models) || p.models.length === 0) {
       throw new Error(`providers.${name}.models: обязателен (непустой список моделей)`);
+    }
+    for (const m of p.models) {
+      if (typeof m !== 'string' || m === '') {
+        throw new Error(`providers.${name}.models: каждая модель должна быть непустой строкой`);
+      }
     }
   }
   return cfg;

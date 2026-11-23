@@ -29,6 +29,22 @@ describe('parseProvidersConfig', () => {
   it('корень не объект → ошибка', () => {
     expect(() => parseProvidersConfig('- a\n')).toThrow(/корень/);
   });
+
+  it('провайдер не объект (null) → ошибка', () => {
+    expect(() => parseProvidersConfig('providers:\n  x: null\n')).toThrow(/объектом/);
+  });
+
+  it('элемент models не строка → ошибка', () => {
+    expect(() =>
+      parseProvidersConfig('providers:\n  x:\n    baseUrl: u\n    apiKeyEnv: K\n    models: [1]\n'),
+    ).toThrow(/строкой/);
+  });
+
+  it('пустой элемент models → ошибка', () => {
+    expect(() =>
+      parseProvidersConfig('providers:\n  x:\n    baseUrl: u\n    apiKeyEnv: K\n    models: [""]\n'),
+    ).toThrow(/строкой/);
+  });
 });
 
 describe('resolveProvider', () => {

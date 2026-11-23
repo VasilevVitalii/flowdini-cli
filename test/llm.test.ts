@@ -26,7 +26,7 @@ describe('chat', () => {
   it('передаёт tools в body', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ choices: [{ message: { role: 'assistant', content: null, tool_calls: [] } }] }),
+      json: async () => ({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
     });
     vi.stubGlobal('fetch', fetchMock);
 
@@ -45,5 +45,33 @@ describe('chat', () => {
   it('нет choices → throw', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ choices: [] }) }));
     await expect(chat('https://x', 'k', 'm', [])).rejects.toThrow(/choices/);
+  });
+
+  it('finish_reason=length → throw (ответ обрезан)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { role: 'assistant', content: 'частичный ответ' }, finish_reason: 'length' }] }),
+    }));
+    await expect(chat('https://x', 'k', 'm', [])).rejects.toThrow(/обрезан/);
+  });
+
+  it('пустое тело без tool_calls → throw', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { role: 'assistant', content: null } }] }),
+    }));
+    await expect(chat('https://x', 'k', 'm', [])).rejects.toThrow(/пустое тело/);
+  });
+
+  it('ответ только с tool_calls (content null) — валиден', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: '1', type: 'function', function: { name: 'x', arguments: '{}' } }] } }],
+      }),
+    }));
+    const msg = await chat('https://x', 'k', 'm', []);
+    expect(msg.tool_calls).toHaveLength(1);
+    expect(msg.content).toBeNull();
   });
 });
