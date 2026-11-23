@@ -520,7 +520,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       }
       break;
     }
-    const addressedRole = step.roles[0];
+    const addressedRole = step.arc.to[0];
     if (roleCovers('HUMAN', addressedRole)) {
       result.stoppedFor = addressedRole;
       break;
