@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "flowdini-engine": "file:../flowdini-engine",
+    "flowdini-engine": "^0.1.0",
     "flowdini-spec": "^0.4.1",
     "yaml": "^2.9.1"
   },
