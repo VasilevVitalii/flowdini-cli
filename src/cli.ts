@@ -82,6 +82,10 @@ async function main(): Promise<void> {
     if (res.drySections.length > 0) {
       console.log('=== dry-run: раздел, который агент написал бы ===');
       for (const s of res.drySections) console.log(s);
+      if (res.dryWarnings.length > 0) {
+        console.log('=== dry-run: предупреждения ===');
+        for (const w of res.dryWarnings) console.log(`  ⚠ ${w}`);
+      }
       console.log('=== конец dry-run (журнал и БД не изменены) ===');
       return;
     }

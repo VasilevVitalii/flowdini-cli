@@ -14,6 +14,7 @@ import {
   buildCrash,
   isNotFoundError,
   snapshotDefinitions,
+  toolCallVerdict,
 } from '../src/driver.js';
 import type { TFdMcpClient } from '../src/mcp.js';
 
@@ -360,5 +361,26 @@ describe('buildUserPrompt: accept-политика', () => {
     const p = buildUserPrompt('AI.ANALYST', journal, null, 'ISSUE 1', 1);
     expect(p).toContain('Раздел выбери сам');
     expect(p).not.toContain('accept');
+  });
+});
+
+describe('toolCallVerdict', () => {
+  const allowed = new Set(['execute_sql', 'get_definition']);
+
+  it('недозволенный — forbid и в обычном, и в dry-run', () => {
+    expect(toolCallVerdict('drop_table', allowed, false)).toBe('forbid');
+    expect(toolCallVerdict('drop_table', allowed, true)).toBe('forbid');
+  });
+
+  it('execute_sql в dry-run — skip (БД не трогаем)', () => {
+    expect(toolCallVerdict('execute_sql', allowed, true)).toBe('skip');
+  });
+
+  it('execute_sql в обычном режиме — execute', () => {
+    expect(toolCallVerdict('execute_sql', allowed, false)).toBe('execute');
+  });
+
+  it('дозволенный read-only в dry-run — execute', () => {
+    expect(toolCallVerdict('get_definition', allowed, true)).toBe('execute');
   });
 });

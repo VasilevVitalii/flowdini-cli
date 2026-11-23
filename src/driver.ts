@@ -43,6 +43,8 @@ export interface TFdRunResult {
   hitMaxSteps: boolean;
   /** dry-run: тексты разделов, которые агент написал бы (не записаны в журнал). */
   drySections: string[];
+  /** dry-run: недозволенные вызовы инструментов, которые агент попытался сделать. */
+  dryWarnings: string[];
 }
 
 const CHAT_FILE = 'chat.md';
@@ -421,6 +423,20 @@ function roleTools(spec: TFdSpecConfig, role: string, mcp?: TFdMcpClient): TFdMc
   return mcp.tools.filter((t) => names.includes(t.name));
 }
 
+/**
+ * Валидация «кандидата-инструмента» против allowlist роли — единая точка и для
+ * обычного прогона, и для dry-run (тот же вердикт, меняется только исполнение).
+ */
+export function toolCallVerdict(
+  name: string,
+  allowed: ReadonlySet<string>,
+  dryRun: boolean,
+): 'execute' | 'skip' | 'forbid' {
+  if (!allowed.has(name)) return 'forbid';
+  if (dryRun && name === 'execute_sql') return 'skip';
+  return 'execute';
+}
+
 /** По завершении таска (DONE) собрать заметки-кандидаты в vault (человек мержит руками). */
 async function generateKnowledgeCandidates(
   spec: TFdSpecConfig,
@@ -453,7 +469,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
   const fixMode = opts.spec.fixMode ?? 'item';
-  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false, drySections: [] };
+  const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false, drySections: [], dryWarnings: [] };
 
   let journal = await readFile(chatPath, 'utf8');
   let content = textToStructure(journal, true);
@@ -508,10 +524,17 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const callTool = opts.mcp !== undefined
       ? async (n: string, a: Record<string, unknown>) => {
           // Защита: агент может вызвать только инструменты своей роли (SPEC tools).
-          if (!allowedTools.has(n)) {
+          const verdict = toolCallVerdict(n, allowedTools, opts.dryRun === true);
+          if (verdict === 'forbid') {
+            if (opts.dryRun) {
+              // dry-run: не бросаем (иначе catch запишет CRASH в журнал), а фиксируем
+              // недозволенный вызов для вывода и даём агенту дописать раздел.
+              result.dryWarnings.push(`${n} (роль ${role})`);
+              return JSON.stringify({ ok: false, forbidden: true, note: `инструмент ${n} не разрешён роли ${role}` });
+            }
             throw new Error(`инструмент ${n} не разрешён роли ${role}`);
           }
-          if (opts.dryRun && n === 'execute_sql') {
+          if (verdict === 'skip') {
             return JSON.stringify({ ok: true, skipped: true, note: 'dry-run: БД не изменялась' });
           }
           return opts.mcp!.call(n, a);
