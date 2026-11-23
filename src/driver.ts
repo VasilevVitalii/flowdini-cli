@@ -16,6 +16,7 @@ import {
   extractDbObjects,
   validateDbObject,
   captureSnapshot,
+  fixReference,
 } from 'flowdini-engine';
 import type { TFdSpecConfig, TFdDbLookup, TFdGetDefinition, TFdRoleSpec, TFdDbObject } from 'flowdini-engine';
 import type { TFdProvidersConfig } from './config.js';
@@ -226,6 +227,28 @@ export function stampRoleFields(
   return contentPretty(content, now);
 }
 
+/** FIX-раздел в режиме `fixMode: item`: ХОСТ формирует подзаголовок `## {ИМЯ} {N}`
+ *  и все свойства (`fd-from`=роль, `fd-createdAt`=now, `fd-to:: AI.REVIEWER`,
+ *  `fd-reply:: [[#<дуга>]]`) по адресу дуги; модель пишет только тело фикса.
+ *  Для дуги без подзаголовка (в FIX не бывает) — fallback на `stampRoleFields`. */
+export function stampFixItem(
+  body: string,
+  role: string,
+  l1Number: number,
+  arcAddr: string,
+  now: () => Date = () => new Date(),
+): string {
+  const l2 = arcAddr.split('#')[1];
+  let inner: string;
+  if (l2 !== undefined && l2.trim() !== '') {
+    const props = `[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]`;
+    inner = `## ${l2}\n${props}\n\n${body.trim()}`;
+  } else {
+    inner = stampRoleFields(body, role, now).trim();
+  }
+  return `${stampHeader('FIX', role, l1Number, arcAddr, now)}${inner}`;
+}
+
 /** Терминальный маркер аварии `# CRASH 1` (без свойств, хост не притворяется ролью):
  *  ошибки + сырой ответ AI. Обе части — в `~~~`-fence: `taskCheck` не проверяет
  *  ссылки внутри fence (`stripFences`), а `~~~` не конфликтует с ```-блоками SQL,
@@ -245,12 +268,21 @@ export function buildCrash(errors: string[], rawAnswer?: string): string {
   return out.join('\n');
 }
 
+/** Доп. контекст промпта хода (per-item FIX). */
+export interface TFdPromptOpts {
+  /** `fixMode` из SPEC: `item` (по умолчанию) — один FIX на замечание (хост формирует заголовок/свойства); `bulk` — один FIX на все замечания. */
+  fixMode?: 'bulk' | 'item';
+  /** Текст справки (предыдущие пункты REVIEW + фиксы) при `fixMode: item`. */
+  fixReference?: string;
+}
+
 export function buildUserPrompt(
   role: string,
   journal: string,
   section: string | null,
   arcAddr: string,
   l1Number: number,
+  opts?: TFdPromptOpts,
 ): string {
   const lines: string[] = [];
   lines.push('Журнал таска (chat.md):');
@@ -258,13 +290,28 @@ export function buildUserPrompt(
   lines.push(journal);
   lines.push('---');
   lines.push('');
-  lines.push(`Следующий ход: роль «${role}» отвечает на дугу «${arcAddr}».`);
+  if (section === 'FIX' && opts?.fixMode !== 'item') {
+    lines.push(`Следующий ход: роль «${role}» отвечает на ВСЕ открытые замечания этого ревью сразу (одна секция на все), а не на одну дугу.`);
+  } else {
+    lines.push(`Следующий ход: роль «${role}» отвечает на дугу «${arcAddr}».`);
+  }
   if (section !== null) {
     lines.push(`L1-заголовок «# ${section} ${l1Number}» и его свойства проставляет хост — ты их НЕ пиши, начинай сразу с содержимого.`);
     if (section === 'CODE') {
       lines.push('Напиши только тело раздела (обычные абзацы/списки, без заголовков).');
     } else if (section === 'FIX') {
-      lines.push('Пиши вложенные заголовки: под каждое замечание из ревью — «## {ИМЯ} N» (тот же BUG/RISK/OTHER и номер, что в ревью) с телом и свойствами `[fd-to:: AI.REVIEWER] [fd-reply:: [[#<пункт ревью>]]]`. Поля `fd-from`/`fd-createdAt` НЕ пиши — их проставляет хост.');
+      if (opts?.fixMode === 'item') {
+        lines.push('Напиши только тело фикса для ЭТОГО одного замечания (обычные абзацы/списки, без заголовка «## …» и без свойств). Заголовок «## {ИМЯ} N» и все свойства (`fd-from`/`fd-createdAt`/`fd-to:: AI.REVIEWER`/`fd-reply`) проставит хост.');
+      } else {
+        lines.push('Пиши вложенные заголовки: под каждое замечание из ревью — «## {ИМЯ} N» (тот же BUG/RISK/OTHER и номер, что в ревью) с телом и свойствами `[fd-to:: AI.REVIEWER] [fd-reply:: [[#<пункт ревью>]]]`. Поля `fd-from`/`fd-createdAt` НЕ пиши — их проставляет хост.');
+      }
+      if (opts?.fixReference !== undefined && opts.fixReference.trim() !== '') {
+        lines.push('');
+        lines.push('Справка — предыдущие пункты этого ревью и твои ответы на них (контекст, НЕ задание; эти пункты уже закрыты, их не трогай):');
+        lines.push('---');
+        lines.push(opts.fixReference);
+        lines.push('---');
+      }
     } else if (section === 'REVIEW') {
       lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Поля fd-from/fd-createdAt НЕ пиши — их проставляет хост. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
     }
@@ -393,6 +440,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
   const vaultRoot = opts.vaultRoot ?? opts.taskDir;
   const connection = opts.connection ?? 'mssql';
   const maxSteps = opts.maxSteps ?? 20;
+  const fixMode = opts.spec.fixMode ?? 'item';
   const result: TFdRunResult = { steps: 0, stoppedFor: null, errors: [], hitMaxSteps: false, drySections: [] };
 
   let journal = await readFile(chatPath, 'utf8');
@@ -430,7 +478,14 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     const gate = step.section === 'REVIEW' && gateDue(content, opts.spec);
     const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
     const l1Number = nextL1Number(content, step.section ?? 'ISSUE');
-    const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number);
+    const reference =
+      step.section === 'FIX' && fixMode === 'item' && opts.spec.fixReference === true
+        ? fixReference(content, step.arc.addr)
+        : undefined;
+    const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number, {
+      fixMode,
+      fixReference: reference,
+    });
     const tools = roleTools(opts.spec, role, opts.mcp);
     const allowedTools = new Set((tools ?? []).map((t) => t.name));
     const callTool = opts.mcp !== undefined
@@ -499,9 +554,14 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // пропускаем, чтобы не трогать тело (в т.ч. fenced SQL). Единый `now` на весь раздел.
     const stepNow = new Date();
     const now = () => stepNow;
-    const body =
-      step.section === 'CODE' ? sectionText.trim() : stampRoleFields(sectionText, role, now).trim();
-    const entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${body}`;
+    let entry: string;
+    if (step.section === 'FIX' && fixMode === 'item') {
+      entry = stampFixItem(sectionText.trim(), role, l1Number, step.arc.addr, now);
+    } else if (step.section === 'CODE') {
+      entry = `${stampHeader('CODE', role, l1Number, step.arc.addr, now)}${sectionText.trim()}`;
+    } else {
+      entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${stampRoleFields(sectionText, role, now).trim()}`;
+    }
 
     // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.
     if (opts.dryRun) {

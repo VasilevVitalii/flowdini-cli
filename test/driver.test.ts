@@ -10,6 +10,7 @@ import {
   nowStamp,
   stampHeader,
   stampRoleFields,
+  stampFixItem,
   buildCrash,
   isNotFoundError,
   snapshotDefinitions,
@@ -285,5 +286,55 @@ describe('stampRoleFields', () => {
   it('пустой текст возвращается как есть', () => {
     expect(stampRoleFields('', 'AI.REVIEWER', now)).toBe('');
     expect(stampRoleFields('  \n', 'AI.REVIEWER', now)).toBe('  \n');
+  });
+});
+
+describe('stampFixItem', () => {
+  const now = () => new Date('2026-11-23T10:20:30.456Z');
+
+  it('формирует подзаголовок и все свойства по дуге; модель — только тело', () => {
+    const out = stampFixItem('исправлено: добавлен индекс', 'AI.CODER.SENIOR', 2, 'REVIEW 1#BUG 3', now);
+    expect(out).toBe(
+      '# FIX 2\n\n## BUG 3\n[fd-from:: AI.CODER.SENIOR] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: AI.REVIEWER] [fd-reply:: [[#REVIEW 1#BUG 3]]]\n\nисправлено: добавлен индекс',
+    );
+  });
+
+  it('дуга без подзаголовка — fallback на stampRoleFields', () => {
+    const out = stampFixItem('## BUG 1\n[fd-to:: AI.REVIEWER]\n\nфикс', 'AI.CODER.SENIOR', 1, 'REVIEW 1', now);
+    expect(out).toContain('# FIX 1');
+    expect(out).toContain('[fd-from:: AI.CODER.SENIOR]');
+    expect(out).toContain('[fd-to:: AI.REVIEWER]');
+  });
+});
+
+describe('buildUserPrompt: fixMode/item', () => {
+  const journal = '# ISSUE 1\n\nb\n';
+
+  it('item — инструкция «только тело», без вложенных заголовков, дуга одна', () => {
+    const p = buildUserPrompt('AI.CODER.SENIOR', journal, 'FIX', 'REVIEW 1#BUG 2', 1, { fixMode: 'item' });
+    expect(p).toContain('только тело фикса');
+    expect(p).not.toContain('Пиши вложенные заголовки');
+    expect(p).toContain('отвечает на дугу «REVIEW 1#BUG 2»');
+  });
+
+  it('bulk — инструкция вложенных заголовков и «все замечания», без фокуса на одну дугу', () => {
+    const p = buildUserPrompt('AI.CODER.SENIOR', journal, 'FIX', 'REVIEW 1', 1, { fixMode: 'bulk' });
+    expect(p).toContain('Пиши вложенные заголовки');
+    expect(p).not.toContain('только тело фикса');
+    expect(p).toContain('ВСЕ открытые замечания');
+    expect(p).not.toContain('отвечает на дугу');
+  });
+
+  it('item + справка — справка попадает в промпт', () => {
+    const ref = 'Замечание «BUG 1»:\n\n## BUG 1\n[fd-from:: AI.REVIEWER]';
+    const p = buildUserPrompt('AI.CODER.SENIOR', journal, 'FIX', 'REVIEW 1#BUG 2', 1, { fixMode: 'item', fixReference: ref });
+    expect(p).toContain('Справка');
+    expect(p).toContain('Замечание «BUG 1»');
+    expect(p).toContain(ref);
+  });
+
+  it('item без справки — секции «Справка» нет', () => {
+    const p = buildUserPrompt('AI.CODER.SENIOR', journal, 'FIX', 'REVIEW 1#BUG 2', 1, { fixMode: 'item' });
+    expect(p).not.toContain('Справка');
   });
 });
