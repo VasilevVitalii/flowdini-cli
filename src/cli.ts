@@ -17,7 +17,7 @@ Flags:
   --providers <path>     конфиг провайдеров (fd.providers.yaml); по умолчанию ./fd.providers.yaml
   --vvdb <dir>           каталог vv-db-mcp (если задан — подключается MCP для БД)
   --vvdb-config <path>   конфиг vv-db-mcp; по умолчанию <vvdb>/.connect.json
-  --vault-root <path>    корень vault для context/fd-vault; по умолчанию cwd
+  --vault-root <path>    корень vault для context/fd-vault; по умолчанию taskDir
   --connection <name>    имя коннекта БД для vv-db-mcp; по умолчанию mssql
   --max-steps <n>        лимит шагов за запуск; по умолчанию 20
   --dry-run              не писать в журнал (печатать раздел в stdout)
