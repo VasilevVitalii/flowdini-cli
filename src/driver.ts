@@ -6,6 +6,7 @@ import type { TFdContent } from 'flowdini-spec';
 import {
   contentPretty,
   nextStep,
+  openArcs,
   roleBrief,
   gateDue,
   taskCheck,
@@ -204,7 +205,8 @@ export { nowStamp };
 /** L1-заголовок раздела, который проставляет ХОСТ (не LLM), по канону:
  *  - `CODE` — заголовок + свойства (`fd-from`, `fd-createdAt`, `fd-to:: AI.REVIEWER`, `fd-reply`);
  *  - `REVIEW` — заголовок + `fd-from`/`fd-createdAt`/`fd-reply` (детерминированно закрывает
- *    дугу CODE/FIX → AI.REVIEWER; подзаголовки `## BUG/RISK/OTHER` — отдельно);
+ *    ВСЕ открытые дуги CODE/FIX → AI.REVIEWER списком `fd-reply`; подзаголовки
+ *    `## BUG/RISK/OTHER` — отдельно);
  *  - `FIX` — заголовок-контейнер без свойств (свойства на вложенных `##`);
  *  - `null` (аналитик сам решает) — пусто: хост не знает раздела, LLM пишет всё.
  *  `now` — источник времени (инъекция для тестов). */
@@ -212,18 +214,20 @@ export function stampHeader(
   section: string | null,
   role: string,
   l1Number: number,
-  arcAddr: string,
+  arcAddrs: string[],
   now: () => Date = () => new Date(),
 ): string {
   if (section === null) return '';
   const head = `# ${section} ${l1Number}`;
+  const replies = arcAddrs.map((a) => `[[#${a}]]`).join(' ');
   if (section === 'CODE') {
-    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]\n\n`;
+    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: ${replies}]\n\n`;
   }
   if (section === 'REVIEW') {
-    // REVIEW закрывает дугу CODE/FIX → AI.REVIEWER детерминированно (fd-from + fd-reply):
-    // иначе «замечаний нет» оставляет дугу открытой и nextStep зацикливает REVIEW.
-    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-reply:: [[#${arcAddr}]]]\n\n`;
+    // REVIEW закрывает ВСЕ дуги CODE/FIX → AI.REVIEWER детерминированно (fd-from + fd-reply):
+    // иначе «замечаний нет» оставляет дугу открытой и nextStep зацикливает REVIEW; а
+    // item-FIX (N разделов) порождал бы N микро-REVIEW и ранний гейт reviewLimit.
+    return `${head}\n[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-reply:: ${replies}]\n\n`;
   }
   return `${head}\n\n`;
 }
@@ -276,7 +280,7 @@ export function stampFixItem(
   } else {
     inner = stampRoleFields(body, role, now).trim();
   }
-  return `${stampHeader('FIX', role, l1Number, arcAddr, now)}${inner}`;
+  return `${stampHeader('FIX', role, l1Number, [arcAddr], now)}${inner}`;
 }
 
 /** Длина тильда-fence для CRASH: строго длиннее любой серии `~` в ограждаемом
@@ -772,13 +776,22 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // ставит L1 сам, `# ISSUE 7` в теле модели не должен стать топиком. Null-кейс модель
     // пишет L1 сама — не трогаем.
     const sanitized = step.section !== null ? stripL1Headers(sectionText) : numberL1Headers(sectionText, content);
+    // Претензия 1: REVIEW закрывает ВСЕ открытые дуги к AI.REVIEWER одним разделом
+    // (список fd-reply) — иначе item-FIX (N разделов) порождает N микро-REVIEW,
+    // reviewFixIterations считает каждый за итерацию и гейт срабатывает раньше порога.
+    const reviewAddrs =
+      step.section === 'REVIEW'
+        ? openArcs(content)
+            .filter((a) => a.to.some((r) => roleCovers('AI.REVIEWER', r)))
+            .map((a) => a.addr)
+        : [step.arc.addr];
     let entry: string;
     if (step.section === 'FIX' && fixMode === 'item') {
       entry = stampFixItem(sanitized.trim(), role, l1Number, step.arc.addr, now);
     } else if (step.section === 'CODE') {
-      entry = `${stampHeader('CODE', role, l1Number, step.arc.addr, now)}${sanitized.trim()}`;
+      entry = `${stampHeader('CODE', role, l1Number, [step.arc.addr], now)}${sanitized.trim()}`;
     } else {
-      entry = `${stampHeader(step.section, role, l1Number, step.arc.addr, now)}${stampRoleFields(sanitized, role, now).trim()}`;
+      entry = `${stampHeader(step.section, role, l1Number, reviewAddrs, now)}${stampRoleFields(sanitized, role, now).trim()}`;
     }
 
     // dry-run: раздел не пишем в журнал — отдаём текстом наружу и выходим.

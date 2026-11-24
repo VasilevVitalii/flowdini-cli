@@ -266,21 +266,27 @@ describe('stampHeader', () => {
   const now = () => new Date('2026-11-23T10:20:30.456Z');
 
   it('CODE — заголовок + все свойства (fd-from, fd-createdAt, fd-to, fd-reply)', () => {
-    const h = stampHeader('CODE', 'AI.CODER.JUNIOR', 2, 'ISSUE 3', now);
+    const h = stampHeader('CODE', 'AI.CODER.JUNIOR', 2, ['ISSUE 3'], now);
     expect(h).toBe(
       '# CODE 2\n[fd-from:: AI.CODER.JUNIOR] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: AI.REVIEWER] [fd-reply:: [[#ISSUE 3]]]\n\n',
     );
   });
 
   it('REVIEW — закрывает дугу детерминированно (fd-from + fd-reply), FIX — контейнер', () => {
-    expect(stampHeader('REVIEW', 'AI.REVIEWER', 1, 'CODE 1', now)).toBe(
+    expect(stampHeader('REVIEW', 'AI.REVIEWER', 1, ['CODE 1'], now)).toBe(
       '# REVIEW 1\n[fd-from:: AI.REVIEWER] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-reply:: [[#CODE 1]]]\n\n',
     );
-    expect(stampHeader('FIX', 'AI.CODER.SENIOR', 1, 'REVIEW 1#BUG 1', now)).toBe('# FIX 1\n\n');
+    expect(stampHeader('FIX', 'AI.CODER.SENIOR', 1, ['REVIEW 1#BUG 1'], now)).toBe('# FIX 1\n\n');
+  });
+
+  it('REVIEW — список fd-reply закрывает ВСЕ дуги item-FIX (претензия 1)', () => {
+    expect(stampHeader('REVIEW', 'AI.REVIEWER', 2, ['FIX 2#BUG 1', 'FIX 2#BUG 2'], now)).toBe(
+      '# REVIEW 2\n[fd-from:: AI.REVIEWER] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-reply:: [[#FIX 2#BUG 1]] [[#FIX 2#BUG 2]]]\n\n',
+    );
   });
 
   it('null (аналитик сам решает) — пусто, LLM пишет всё', () => {
-    expect(stampHeader(null, 'AI.ANALYST', 1, 'ISSUE 1', now)).toBe('');
+    expect(stampHeader(null, 'AI.ANALYST', 1, ['ISSUE 1'], now)).toBe('');
   });
 });
 
