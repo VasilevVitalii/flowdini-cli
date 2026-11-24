@@ -58,7 +58,27 @@ function nextL1Number(content: TFdContent, title: string): number {
   for (const l1 of level1List(content)) {
     if (l1.title === title && l1.idx > max) max = l1.idx;
   }
+  if (max >= Number.MAX_SAFE_INTEGER) {
+    throw new Error(`nextL1Number: номер раздела «${title}» достиг MAX_SAFE_INTEGER — журнал не может расти дальше`);
+  }
   return max + 1;
+}
+
+/** Null-кейс (аналитик сам пишет раздел): модель пишет `# ISSUE`/`# QUESTIONS`
+ *  БЕЗ номера — номер проставляет хост, не модель (иначе парсер даст `idx: 0` и
+ *  taskCheck отвергнет раздел как «заголовок без номера»). Дописываем номер по
+ *  `nextL1Number` ДО парсинга. */
+function numberL1Headers(text: string, content: TFdContent): string {
+  return text
+    .split('\n')
+    .map((line) => {
+      const m = /^ {0,3}#\s+([A-Z][A-Za-z]*)\s*$/.exec(line);
+      if (m === null) return line;
+      const title = m[1];
+      if (title !== 'ISSUE' && title !== 'QUESTIONS') return line;
+      return `# ${title} ${nextL1Number(content, title)}`;
+    })
+    .join('\n');
 }
 
 async function readIfExists(path: string): Promise<string | null> {
@@ -143,7 +163,7 @@ async function buildSystemPrompt(
     const rp = await realpath(p).catch(() => null);
     if (rp === null) continue; // файла нет
     if (rp !== vaultReal && !rp.startsWith(vaultReal + sep)) continue; // вне vault
-    const text = await readIfExists(p);
+    const text = await readIfExists(rp);
     if (text !== null) {
       lines.push(`Контекст из «${f}»:`);
       lines.push('```');
@@ -443,7 +463,7 @@ export function makeLookup(mcp: TFdMcpClient, connection: string): TFdDbLookup {
   return async (objPath: string) => {
     const { name, schema, dbPrefix } = splitObjPath(objPath);
     if (dbPrefix !== undefined && dbPrefix !== connection) {
-      throw new Error(`obj-path ${objPath}: база "${dbPrefix}" не совпадает с connection "${connection}"`);
+      return { exists: null, kind: null, reason: `obj-path ${objPath}: база "${dbPrefix}" не совпадает с connection "${connection}"` };
     }
     for (const kind of DB_KINDS) {
       let probe: TProbe;
@@ -467,12 +487,7 @@ export function makeGetDefinition(mcp: TFdMcpClient, connection: string): TFdGet
       throw new Error(`obj-path ${objPath}: база "${dbPrefix}" не совпадает с connection "${connection}"`);
     }
     for (const kind of DB_KINDS) {
-      let probe: TProbe;
-      try {
-        probe = await probeDefinition(mcp, connection, name, schema, kind);
-      } catch (e) {
-        throw e; // сбой сети/прав пробрасываем наружу
-      }
+      const probe = await probeDefinition(mcp, connection, name, schema, kind);
       if (probe === 'notfound') continue;
       if (probe === 'okfalse') {
         throw new Error(`get_definition: ${objPath}: ok:false (сбой, не «объекта нет»)`);
@@ -507,9 +522,16 @@ export function snapshotDefinitions(
 }
 
 function roleTools(spec: TFdSpecConfig, role: string, mcp?: TFdMcpClient): TFdMcpTool[] | undefined {
-  if (mcp === undefined) return undefined;
   const names = resolveRole(spec, role).tools;
   if (names === undefined || names.length === 0) return undefined;
+  if (mcp === undefined) {
+    throw new Error(`роль ${role} требует инструменты ${names.join(', ')}, но MCP-клиент не задан`);
+  }
+  const available = new Set(mcp.tools.map((t) => t.name));
+  const missing = names.filter((n) => !available.has(n));
+  if (missing.length > 0) {
+    throw new Error(`роль ${role}: инструменты недоступны у MCP: ${missing.join(', ')}`);
+  }
   return mcp.tools.filter((t) => names.includes(t.name));
 }
 
@@ -643,7 +665,13 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       fixReference: reference,
       acceptAnswer: acceptAnswer ?? undefined,
     });
-    const tools = roleTools(opts.spec, role, opts.mcp);
+    let tools: TFdMcpTool[] | undefined;
+    try {
+      tools = roleTools(opts.spec, role, opts.mcp);
+    } catch (e) {
+      result.errors.push(String((e as Error)?.message ?? e));
+      break;
+    }
     const allowedTools = new Set((tools ?? []).map((t) => t.name));
     // budget.maxTurns (SPEC) — лимит tool-calling ходов на шаг роли; иначе 8 (по умолчанию).
     const budgetTurns = brief.spec.budget?.maxTurns;
@@ -724,8 +752,9 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     } catch (err) {
       const msg = `${role}: ${err instanceof Error ? err.message : String(err)}`;
       if (opts.dryRun) {
-        // dry-run не пишет журнал: сбой роли фиксируем в dryWarnings, не в # CRASH.
-        result.dryWarnings.push(msg);
+        // dry-run не пишет журнал (# CRASH не уместен), но сбой роли — ошибка:
+        // прогон не завершился штатно, exit-код должен быть ненулевым.
+        result.errors.push(msg);
         break;
       }
       const tmpPath = `${chatPath}.tmp`;
@@ -742,7 +771,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // C3: для non-null секций срезаем L1-заголовки из ответа модели (вне fence) — хост
     // ставит L1 сам, `# ISSUE 7` в теле модели не должен стать топиком. Null-кейс модель
     // пишет L1 сама — не трогаем.
-    const sanitized = step.section !== null ? stripL1Headers(sectionText) : sectionText;
+    const sanitized = step.section !== null ? stripL1Headers(sectionText) : numberL1Headers(sectionText, content);
     let entry: string;
     if (step.section === 'FIX' && fixMode === 'item') {
       entry = stampFixItem(sanitized.trim(), role, l1Number, step.arc.addr, now);

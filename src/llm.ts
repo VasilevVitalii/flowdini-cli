@@ -57,17 +57,41 @@ export async function chat(
   if (choice.finish_reason === 'length') {
     throw new Error('LLM: ответ обрезан провайдером (finish_reason=length)');
   }
+  // fail-closed: ответ модели — только роль `assistant` (или отсутствует), иначе сбой.
   const role = msg.role;
-  if (role !== undefined && !['system', 'user', 'assistant', 'tool'].includes(role)) {
+  if (role !== undefined && role !== 'assistant') {
     throw new Error(`LLM: неизвестная роль ответа: "${role}"`);
   }
+  const rawContent = msg.content;
+  if (rawContent !== undefined && rawContent !== null && typeof rawContent !== 'string') {
+    throw new Error('LLM: content ответа не строка');
+  }
+  const content = rawContent ?? null;
+  if (msg.tool_calls !== undefined) {
+    const raw = msg.tool_calls as unknown;
+    if (!Array.isArray(raw)) {
+      throw new Error('LLM: tool_calls не массив');
+    }
+    for (const el of raw) {
+      const tc = el as { id?: unknown; type?: unknown; function?: unknown } | null;
+      if (tc === null || typeof tc !== 'object') throw new Error('LLM: элемент tool_calls не объект');
+      if (typeof tc.id !== 'string' || tc.id === '') throw new Error('LLM: tool_call без id');
+      if (tc.type !== undefined && tc.type !== 'function') throw new Error('LLM: tool_call.type не function');
+      const fn = tc.function as { name?: unknown; arguments?: unknown } | null;
+      if (fn === null || typeof fn !== 'object' || typeof fn.name !== 'string' || fn.name === '') {
+        throw new Error('LLM: tool_call без function.name');
+      }
+      if (fn.arguments !== undefined && typeof fn.arguments !== 'string') {
+        throw new Error('LLM: tool_call arguments не строка');
+      }
+    }
+  }
   const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-  const content = msg.content ?? null;
   if (!hasToolCalls && (content === null || content.trim() === '')) {
     throw new Error('LLM: пустое тело ответа (нет content и tool_calls)');
   }
   return {
-    role: (role as TFdChatMessage['role']) ?? 'assistant',
+    role: 'assistant',
     content,
     tool_calls: msg.tool_calls,
   };

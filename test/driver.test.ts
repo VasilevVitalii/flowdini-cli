@@ -79,12 +79,16 @@ describe('makeLookup', () => {
     const lookup = makeLookup(mcp, 'mssql');
     await expect(lookup('dbo.sp_x')).resolves.toEqual({ exists: null, kind: null });
   });
-  it('трёхчастный obj-path с БД, не совпадающей с connection → бросает (префикс не игнорируем)', async () => {
+  it('трёхчастный obj-path с БД, не совпадающей с connection → exists:null с причиной (префикс не игнорируем)', async () => {
     const mcp = mockMcp(() => {
       throw new Error('не должен вызываться');
     });
     const lookup = makeLookup(mcp, 'mssql');
-    await expect(lookup('otherdb.dbo.sp_x')).rejects.toThrow('не совпадает с connection');
+    await expect(lookup('otherdb.dbo.sp_x')).resolves.toEqual({
+      exists: null,
+      kind: null,
+      reason: 'obj-path otherdb.dbo.sp_x: база "otherdb" не совпадает с connection "mssql"',
+    });
   });
 });
 
