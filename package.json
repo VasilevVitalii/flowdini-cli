@@ -1,6 +1,6 @@
 {
   "name": "flowdini-cli",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Autonomous runtime for flowdini: executes roles via LLM provider APIs and MCP (no external agents)",
   "type": "module",
   "bin": {
@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "flowdini-engine": "^0.2.6",
+    "flowdini-engine": "^0.2.7",
     "flowdini-spec": "^0.5.0",
     "yaml": "^2.9.1"
   },

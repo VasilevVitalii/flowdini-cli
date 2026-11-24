@@ -16,6 +16,7 @@ import {
   snapshotDefinitions,
   toolCallVerdict,
   stripL1Headers,
+  hasHeadings,
 } from '../src/driver.js';
 import type { TFdMcpClient } from '../src/mcp.js';
 
@@ -147,14 +148,14 @@ describe('collectTaskObjects', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('читает issue-app.md и result-app.md, игнорирует chat.md', async () => {
+  it('читает только issue-app.md, игнорирует result-app.md и chat.md', async () => {
     const obj = (path: string) =>
       `# ISSUE 1\n\n## OBJECT 1\n[obj-kind:: procedure] [obj-action:: create] [obj-path:: ${path}]\n\nbody\n`;
     await writeFile(join(dir, 'issue-app.md'), obj('dbo.p_a'));
     await writeFile(join(dir, 'result-app.md'), obj('dbo.v_b'));
     await writeFile(join(dir, 'chat.md'), obj('dbo.ignore'));
     const objs = await collectTaskObjects(dir);
-    expect(objs.map((o) => o.objPath).sort()).toEqual(['dbo.p_a', 'dbo.v_b']);
+    expect(objs.map((o) => o.objPath)).toEqual(['dbo.p_a']);
   });
 
   it('рекурсивно находит в подпапке', async () => {
@@ -168,13 +169,19 @@ describe('collectTaskObjects', () => {
     expect(objs.some((o) => o.objPath === 'dbo.deep')).toBe(true);
   });
 
-  it('дедуп по obj-path', async () => {
-    const a = '# ISSUE 1\n\n## OBJECT 1\n[obj-kind:: procedure] [obj-action:: create] [obj-path:: dbo.dup]\n\nbody\n';
-    const b = '# ISSUE 1\n\n## OBJECT 1\n[obj-kind:: procedure] [obj-action:: edit] [obj-path:: dbo.dup]\n\nbody\n';
+  it('дедуп по obj-path внутри issue-app.md', async () => {
+    const a = '# ISSUE 1\n\n## OBJECT 1\n[obj-kind:: procedure] [obj-action:: create] [obj-path:: dbo.dup]\n\nbody\n\n## OBJECT 2\n[obj-kind:: procedure] [obj-action:: edit] [obj-path:: dbo.dup]\n\nbody\n';
     await writeFile(join(dir, 'issue-app.md'), a);
-    await writeFile(join(dir, 'result-app.md'), b);
     const objs = await collectTaskObjects(dir);
     expect(objs.filter((o) => o.objPath === 'dbo.dup').length).toBe(1);
+  });
+
+  it('не заходит в snapshots/ и скрытые каталоги', async () => {
+    const snap = join(dir, 'snapshots');
+    await mkdir(snap, { recursive: true });
+    await writeFile(join(snap, 'issue-app.md'), '# ISSUE 1\n\n## OBJECT 1\n[obj-kind:: procedure] [obj-action:: create] [obj-path:: dbo.snap]\n\nbody\n');
+    const objs = await collectTaskObjects(dir);
+    expect(objs.some((o) => o.objPath === 'dbo.snap')).toBe(false);
   });
 });
 
@@ -337,6 +344,46 @@ describe('stripL1Headers', () => {
     const out = stripL1Headers('~~~\n# внутри\n~~~\n# снаружи');
     expect(out).toContain('# внутри');
     expect(out).not.toContain('# снаружи');
+  });
+
+  it('отступ 4 пробела — не заголовок (не срезается)', () => {
+    const out = stripL1Headers('    # не заголовок\nтекст');
+    expect(out).toContain('# не заголовок');
+  });
+
+  it('голый # — L1-заголовок, срезается', () => {
+    const out = stripL1Headers('#\nтекст');
+    expect(out).not.toContain('#');
+    expect(out).toContain('текст');
+  });
+
+  it('#### (4 #) — не заголовок ATX (HEADING_RE — до 3), не срезается', () => {
+    const out = stripL1Headers('#### x\nтекст');
+    expect(out).toContain('#### x');
+  });
+
+  it('fence закрывается только маркером той же/большей длины', () => {
+    const out = stripL1Headers('`````\n```\n# внутри\n`````\n# снаружи');
+    expect(out).toContain('# внутри');
+    expect(out).not.toContain('# снаружи');
+  });
+});
+
+describe('hasHeadings', () => {
+  it('L2-заголовок вне fence — true', () => {
+    expect(hasHeadings('текст\n## BUG 1\nещё')).toBe(true);
+  });
+
+  it('L1-заголовок — true', () => {
+    expect(hasHeadings('# ISSUE 1\nтекст')).toBe(true);
+  });
+
+  it('обычный текст без заголовков — false', () => {
+    expect(hasHeadings('просто текст\nещё строка')).toBe(false);
+  });
+
+  it('заголовок внутри fence — false', () => {
+    expect(hasHeadings('```sql\n# комментарий\nSELECT 1\n```')).toBe(false);
   });
 });
 

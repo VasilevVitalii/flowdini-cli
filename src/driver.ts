@@ -1,7 +1,7 @@
 // Драйвер цикла исполнения: nextStep → roleBrief → агент-роль (LLM + MCP) → раздел → taskCheck → снапшот.
 import { readFile, writeFile, readdir, rename, realpath } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
-import { textToStructure } from 'flowdini-spec';
+import { textToStructure, HEADING_RE, openFence, isClosingFence } from 'flowdini-spec';
 import type { TFdContent } from 'flowdini-spec';
 import {
   contentPretty,
@@ -90,19 +90,24 @@ async function readIfExists(path: string): Promise<string | null> {
   }
 }
 
-// Все OBJECT-объекты таска: живут в issue-app.md/result-app.md, а НЕ в chat.md.
-// Рекурсивный обход taskDir (vault может быть вложен); дедуп по obj-path.
+// Все OBJECT-объекты таска: живут ТОЛЬКО в issue-app.md (план), а НЕ в chat.md.
+// result-app.md — отчёт о результате, не план: его OBJECT не участвуют в сверке БД
+// и в снапшотах (иначе create/edit одного obj-path конфликтуют между файлами).
+// Рекурсивный обход taskDir (vault может быть вложен); дедуп по obj-path;
+// обход детерминированный (сортировка по имени), snapshots/ и скрытые каталоги пропускаем.
 export async function collectTaskObjects(taskDir: string): Promise<TFdDbObject[]> {
   const seen = new Set<string>();
   const objects: TFdDbObject[] = [];
-  const targets = new Set(['issue-app.md', 'result-app.md']);
   async function walk(dir: string): Promise<void> {
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    const entries = (await readdir(dir, { withFileTypes: true }).catch(() => [])).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    );
     for (const e of entries) {
       const p = join(dir, e.name);
       if (e.isDirectory()) {
+        if (e.name === 'snapshots' || e.name.startsWith('.')) continue;
         await walk(p);
-      } else if (targets.has(e.name)) {
+      } else if (e.isFile() && e.name === 'issue-app.md') {
         const text = await readIfExists(p);
         if (text === null) continue;
         for (const o of extractDbObjects(textToStructure(text, true))) {
@@ -319,29 +324,62 @@ export function buildCrash(errors: string[], rawAnswer?: string): string {
 
 /** Убрать L1-заголовки (`# …`) из ответа модели вне ```/~~~ fence. Для non-null секций
  *  (CODE/REVIEW/FIX) L1 проставляет хост: `# ISSUE 7` в теле модели — инъекция, которая
- *  иначе стала бы настоящим топиком и открыла дуги. `##` и глубже оставляем (их в
- *  REVIEW/bulk-FIX пишет сама модель; заголовки в CODE/FIX-item ловит `taskCheck`). */
+ *  иначе стала бы настоящим топиком и открыла дуги. Грамматика — та же, что в spec
+ *  (`HEADING_RE`/`openFence`/`isClosingFence`): заголовок = 0–3 пробела + `#` (один),
+ *  fence открывается/закрывается по символу И длине маркера. `##`/`###` оставляем
+ *  (их в REVIEW/bulk-FIX пишет сама модель; в CODE/item-FIX ловит `hasHeadings`). */
 export function stripL1Headers(text: string): string {
   const lines = text.split('\n');
-  let fence: '`' | '~' | null = null;
+  let fenceChar: string | null = null;
+  let fenceLen = 0;
   const out: string[] = [];
   for (const line of lines) {
-    const m = /^\s*(```+|~~~+)/.exec(line);
-    if (m !== null) {
-      const marker = m[1][0] === '`' ? ('`' as const) : ('~' as const);
-      if (fence === null) fence = marker;
-      else if (fence === marker) fence = null;
-      // иной маркер внутри открытого fence — контент, состояние не меняем.
+    if (fenceChar === null) {
+      const open = openFence(line);
+      if (open !== null) {
+        fenceChar = open.char;
+        fenceLen = open.len;
+        out.push(line);
+        continue;
+      }
+      const h = HEADING_RE.exec(line);
+      if (h !== null && h[1].length === 1) {
+        out.push('');
+        continue;
+      }
       out.push(line);
-      continue;
+    } else {
+      if (isClosingFence(line, fenceChar, fenceLen)) {
+        fenceChar = null;
+        fenceLen = 0;
+      }
+      out.push(line);
     }
-    if (fence === null && /^#\s/.test(line)) {
-      out.push('');
-      continue;
-    }
-    out.push(line);
   }
   return out.join('\n');
+}
+
+/** Остался ли заголовок любого уровня (`#`/`##`/`###`) вне fence. Для CODE и item-FIX
+ *  тела заголовков быть не должно: их проставляет хост, а L2/L3 из прозы модели стали
+ *  бы подтопиками и подделали маршрут дуг. */
+export function hasHeadings(text: string): boolean {
+  let fenceChar: string | null = null;
+  let fenceLen = 0;
+  for (const line of text.split('\n')) {
+    if (fenceChar === null) {
+      const open = openFence(line);
+      if (open !== null) {
+        fenceChar = open.char;
+        fenceLen = open.len;
+        continue;
+      }
+      if (HEADING_RE.test(line)) return true;
+    } else if (isClosingFence(line, fenceChar, fenceLen)) {
+      fenceChar = null;
+      fenceLen = 0;
+    }
+  }
+  return false;
 }
 
 /** Доп. контекст промпта хода (per-item FIX). */
@@ -801,17 +839,25 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     }
 
     const candidate = `${journal.trimEnd()}\n\n${entry.trim()}\n`;
-    // Атомарная запись: tmp + rename — журнал никогда не остаётся полузаписанным.
     const tmpPath = `${chatPath}.tmp`;
-    await writeFile(tmpPath, candidate);
-    await rename(tmpPath, chatPath);
+    // K4: валидация кандидата ДО публикации — taskCheck по содержимому chat.md-кандидата
+    // (override), журнал на диске ещё не тронут. Битый раздел в журнал не попадает.
     content = textToStructure(candidate, true);
-
-    let errs: Array<{ relativeFileName: string; error: string }>;
-    try {
-      errs = await taskCheck(opts.taskDir, { exclude: ['issue-draft.md', 'issue-dom.md', 'knowledge-candidates.md'], vaultRoot });
-    } catch (e) {
-      errs = [{ relativeFileName: CHAT_FILE, error: `taskCheck failed: ${String((e as Error)?.message ?? e)}` }];
+    let errs: Array<{ relativeFileName: string; error: string }> = [];
+    // C3: тело CODE и item-FIX не должно содержать заголовков — их проставляет хост,
+    // L2/L3 из прозы модели стали бы подтопиками и подделали маршрут дуг.
+    if ((step.section === 'CODE' || (step.section === 'FIX' && fixMode === 'item')) && hasHeadings(sanitized)) {
+      errs.push({ relativeFileName: CHAT_FILE, error: `тело ${step.section} не должно содержать заголовков (их проставляет хост)` });
+    } else {
+      try {
+        errs = await taskCheck(opts.taskDir, {
+          exclude: ['issue-draft.md', 'issue-dom.md', 'knowledge-candidates.md'],
+          vaultRoot,
+          override: { fileName: CHAT_FILE, text: candidate },
+        });
+      } catch (e) {
+        errs = [{ relativeFileName: CHAT_FILE, error: `taskCheck failed: ${String((e as Error)?.message ?? e)}` }];
+      }
     }
     // P0: при превышении reviewLimit гейт обязателен — этот REVIEW обязан начинаться
     // с `## Q` к HUMAN.CODER (taskCheck проверяет порядок/адресат, но не наличие).
@@ -824,7 +870,7 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       }
     }
     if (errs.length > 0) {
-      // Битый раздел не оставляем: откат к состоянию ДО ответа роли + # CRASH.
+      // Битый раздел не публикуем: откат к состоянию ДО ответа роли + # CRASH.
       const crashBody = buildCrash(errs.map((e) => `${e.relativeFileName}: ${e.error}`), sectionText);
       const rolledBack = `${journal.trimEnd()}\n\n${crashBody}\n`;
       await writeFile(tmpPath, rolledBack);
@@ -835,13 +881,23 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       content = textToStructure(rolledBack, true);
       break;
     }
+    // Атомарная запись: tmp + rename — журнал никогда не остаётся полузаписанным.
+    await writeFile(tmpPath, candidate);
+    await rename(tmpPath, chatPath);
     result.steps++;
     journal = candidate;
 
     // Снапшот после CODE/FIX: определения объектов → captureSnapshot.
+    // F5: при неполном наборе определений манифест НЕ пишем и прогон стопим — иначе
+    // частичный снимок следующий запуск сочтёт готовым и не доснимет.
     if (step.section === 'CODE' || step.section === 'FIX') {
       if (opts.mcp !== undefined) {
-        const defs = await snapshotDefinitions(await collectTaskObjects(opts.taskDir), makeGetDefinition(opts.mcp, connection), result.errors);
+        const snapErrors: string[] = [];
+        const defs = await snapshotDefinitions(await collectTaskObjects(opts.taskDir), makeGetDefinition(opts.mcp, connection), snapErrors);
+        if (snapErrors.length > 0) {
+          result.errors.push(...snapErrors);
+          break;
+        }
         const iteration = level1List(content).filter((l) => l.title === 'CODE' || l.title === 'FIX').length;
         await captureSnapshot(opts.taskDir, iteration, defs);
       }
