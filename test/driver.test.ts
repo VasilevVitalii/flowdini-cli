@@ -17,8 +17,12 @@ import {
   toolCallVerdict,
   stripL1Headers,
   hasHeadings,
+  numberL1Headers,
+  hasOpenFence,
+  readLatestSnapshot,
 } from '../src/driver.js';
 import type { TFdMcpClient } from '../src/mcp.js';
+import { textToStructure } from 'flowdini-spec';
 
 function mockMcp(call: (tool: string, args: Record<string, unknown>) => string): TFdMcpClient {
   return { tools: [], call: async (t, a) => call(t, a), close: async () => {} };
@@ -436,11 +440,11 @@ describe('stampFixItem', () => {
     );
   });
 
-  it('дуга без подзаголовка — fallback на stampRoleFields', () => {
-    const out = stampFixItem('## BUG 1\n[fd-to:: AI.REVIEWER]\n\nфикс', 'AI.CODER.SENIOR', 1, 'REVIEW 1', now);
-    expect(out).toContain('# FIX 1');
-    expect(out).toContain('[fd-from:: AI.CODER.SENIOR]');
-    expect(out).toContain('[fd-to:: AI.REVIEWER]');
+  it('дуга без подзаголовка (L1 REVIEW) — fallback ставит fd-reply на L1-дугу (R10)', () => {
+    const out = stampFixItem('исправлено: добавлен индекс', 'AI.CODER.SENIOR', 1, 'REVIEW 1', now);
+    expect(out).toBe(
+      '# FIX 1\n\n[fd-from:: AI.CODER.SENIOR] [fd-createdAt:: 2026-11-23T10:20:30Z] [fd-to:: AI.REVIEWER] [fd-reply:: [[#REVIEW 1]]]\n\nисправлено: добавлен индекс',
+    );
   });
 });
 
@@ -518,5 +522,122 @@ describe('toolCallVerdict', () => {
 
   it('дозволенный read-only в dry-run — execute', () => {
     expect(toolCallVerdict('get_definition', allowed, true)).toBe('execute');
+  });
+});
+
+describe('numberL1Headers (R13)', () => {
+  const empty = textToStructure('', true);
+  const withIssue3 = textToStructure('# ISSUE 3\n\nx\n', true);
+
+  it('голый L1 получает номер', () => {
+    expect(numberL1Headers('# ISSUE\n\ntext\n', empty)).toBe('# ISSUE 1\n\ntext\n');
+  });
+
+  it('уже нумерованный L1 пере-нумеруется (с учётом существующих)', () => {
+    expect(numberL1Headers('# ISSUE 3\n\nx\n', withIssue3)).toBe('# ISSUE 4\n\nx\n');
+  });
+
+  it('несколько одноимённых L1 — разные последовательные номера', () => {
+    expect(numberL1Headers('# ISSUE\n\na\n# ISSUE\n\nb\n', empty)).toBe('# ISSUE 1\n\na\n# ISSUE 2\n\nb\n');
+  });
+
+  it('QUESTIONS нумеруется отдельно от ISSUE', () => {
+    expect(numberL1Headers('# ISSUE\n\na\n# QUESTIONS\n\nq\n', empty)).toBe('# ISSUE 1\n\na\n# QUESTIONS 1\n\nq\n');
+  });
+
+  it('строки-примеры внутри fence не трогаются', () => {
+    const text = '```sql\n# ISSUE 99\n```\n# ISSUE\n\nx\n';
+    expect(numberL1Headers(text, empty)).toBe('```sql\n# ISSUE 99\n```\n# ISSUE 1\n\nx\n');
+  });
+
+  it('не-ISSUE/QUESTIONS L1 остаётся без номера (R4 валидирует тип отдельно)', () => {
+    expect(numberL1Headers('# CODE 5\n\nx\n', empty)).toBe('# CODE 5\n\nx\n');
+  });
+});
+
+describe('hasOpenFence (R4)', () => {
+  it('закрытый fence — false', () => {
+    expect(hasOpenFence('```sql\nSELECT 1\n```\n')).toBe(false);
+  });
+
+  it('незакрытый fence — true', () => {
+    expect(hasOpenFence('```sql\nSELECT 1\n')).toBe(true);
+  });
+
+  it('без fence — false', () => {
+    expect(hasOpenFence('# ISSUE 1\n\ntext\n')).toBe(false);
+  });
+
+  it('~~~ тоже ловится', () => {
+    expect(hasOpenFence('~~~\ncode\n')).toBe(true);
+  });
+});
+
+describe('readLatestSnapshot (R7)', () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'fd-snap-'));
+    await mkdir(join(dir, 'snapshots', '1'), { recursive: true });
+    await mkdir(join(dir, 'snapshots', '2'), { recursive: true });
+    await mkdir(join(dir, 'snapshots', 'baseline'), { recursive: true });
+    await writeFile(join(dir, 'snapshots', '1', 'a.sql'), 'CREATE PROCEDURE a\n');
+    await writeFile(join(dir, 'snapshots', '2', 'b.sql'), 'CREATE PROCEDURE b\n');
+    await writeFile(join(dir, 'snapshots', '2', 'c.sql'), 'CREATE PROCEDURE c\n');
+    await writeFile(join(dir, 'snapshots', 'baseline', 'z.sql'), 'CREATE PROCEDURE z\n');
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('нет snapshots/ — null', async () => {
+    const d2 = await mkdtemp(join(tmpdir(), 'fd-nosnap-'));
+    try {
+      await expect(readLatestSnapshot(d2)).resolves.toBeNull();
+    } finally {
+      await rm(d2, { recursive: true, force: true });
+    }
+  });
+
+  it('берёт максимальный числовой каталог, baseline не считается', async () => {
+    const out = await readLatestSnapshot(dir);
+    expect(out).not.toBeNull();
+    expect(out).toContain('### b.sql');
+    expect(out).toContain('### c.sql');
+    expect(out).not.toContain('a.sql');
+    expect(out).not.toContain('z.sql');
+  });
+
+  it('порядок файлов детерминирован (сортировка)', async () => {
+    const out = await readLatestSnapshot(dir);
+    expect(out).not.toBeNull();
+    expect(out!.indexOf('### b.sql')).toBeLessThan(out!.indexOf('### c.sql'));
+  });
+});
+
+describe('buildUserPrompt: REVIEW (R7/R9)', () => {
+  const journal = '# CODE 1\n\nx\n';
+
+  it('одиночная дуга — предупреждение «несколько дуг» не выводится', () => {
+    const p = buildUserPrompt('AI.REVIEWER', journal, 'REVIEW', 'CODE 1', 1, { reviewAddrs: ['CODE 1'] });
+    expect(p).not.toContain('несколько дуг');
+  });
+
+  it('несколько дуг — предупреждение со списком адресов', () => {
+    const p = buildUserPrompt('AI.REVIEWER', journal, 'REVIEW', 'CODE 1', 1, { reviewAddrs: ['CODE 1', 'FIX 1'] });
+    expect(p).toContain('несколько дуг');
+    expect(p).toContain('«CODE 1»');
+    expect(p).toContain('«FIX 1»');
+  });
+
+  it('снимок попадает в промпт REVIEW', () => {
+    const snap = '### dbo.sp_a.sql\nCREATE PROCEDURE dbo.sp_a\n';
+    const p = buildUserPrompt('AI.REVIEWER', journal, 'REVIEW', 'CODE 1', 1, { snapshotText: snap });
+    expect(p).toContain('Актуальный снимок БД');
+    expect(p).toContain(snap);
+  });
+
+  it('без снимка — секции «Актуальный снимок» нет', () => {
+    const p = buildUserPrompt('AI.REVIEWER', journal, 'REVIEW', 'CODE 1', 1);
+    expect(p).not.toContain('Актуальный снимок БД');
   });
 });

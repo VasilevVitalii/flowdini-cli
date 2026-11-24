@@ -67,19 +67,47 @@ function nextL1Number(content: TFdContent, title: string): number {
 
 /** Null-кейс (аналитик сам пишет раздел): модель пишет `# ISSUE`/`# QUESTIONS`
  *  БЕЗ номера — номер проставляет хост, не модель (иначе парсер даст `idx: 0` и
- *  taskCheck отвергнет раздел как «заголовок без номера»). Дописываем номер по
- *  `nextL1Number` ДО парсинга. */
-function numberL1Headers(text: string, content: TFdContent): string {
-  return text
-    .split('\n')
-    .map((line) => {
-      const m = /^ {0,3}#\s+([A-Z][A-Za-z]*)\s*$/.exec(line);
-      if (m === null) return line;
-      const title = m[1];
-      if (title !== 'ISSUE' && title !== 'QUESTIONS') return line;
-      return `# ${title} ${nextL1Number(content, title)}`;
-    })
-    .join('\n');
+ *  taskCheck отвергнет раздел как «заголовок без номера»). R13: пере-нумеруем и
+ *  голые, и УЖЕ пронумерованные заголовки (`# ISSUE 3` → корректный номер), чтобы
+ *  «с номером» из вывода модели не расходился с промптом «БЕЗ номера» и не давал
+ *  коллизий; несколько одноимённых L1 получают РАЗНЫЕ последовательные номера;
+ *  строки-примеры внутри fence не трогаем (грамматика spec: `openFence`/`isClosingFence`). */
+export function numberL1Headers(text: string, content: TFdContent): string {
+  const counters = new Map<string, number>();
+  let fenceChar: string | null = null;
+  let fenceLen = 0;
+  const out: string[] = [];
+  for (const line of text.split('\n')) {
+    if (fenceChar === null) {
+      const open = openFence(line);
+      if (open !== null) {
+        fenceChar = open.char;
+        fenceLen = open.len;
+        out.push(line);
+        continue;
+      }
+      const h = HEADING_RE.exec(line);
+      if (h !== null && h[1].length === 1) {
+        const raw = (h[2] ?? '').trim();
+        const sp = raw.indexOf(' ');
+        const title = sp === -1 ? raw : raw.slice(0, sp);
+        if (title === 'ISSUE' || title === 'QUESTIONS') {
+          const n = counters.get(title) ?? nextL1Number(content, title);
+          counters.set(title, n + 1);
+          out.push(`# ${title} ${n}`);
+          continue;
+        }
+      }
+      out.push(line);
+    } else {
+      if (isClosingFence(line, fenceChar, fenceLen)) {
+        fenceChar = null;
+        fenceLen = 0;
+      }
+      out.push(line);
+    }
+  }
+  return out.join('\n');
 }
 
 async function readIfExists(path: string): Promise<string | null> {
@@ -88,6 +116,51 @@ async function readIfExists(path: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/** R7: текст определений последнего post-change снимка (наибольшая числовая итерация
+ *  в `snapshots/`, `baseline` не считается). Порядок файлов детерминирован (сортировка),
+ *  каждый объект — блоком `### <file>` + текст. Нет снимков — `null`. Сбой чтения одного
+ *  файла не роняет прогон (снимок — контекст ревью, не обязательный материал). */
+export async function readLatestSnapshot(taskDir: string): Promise<string | null> {
+  const snapsDir = join(taskDir, 'snapshots');
+  const entries = await readdir(snapsDir, { withFileTypes: true }).catch(() => []);
+  let latest = -1;
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const n = Number(e.name);
+    if (Number.isInteger(n) && n >= 1 && n > latest) latest = n;
+  }
+  if (latest < 1) return null;
+  const dir = join(snapsDir, String(latest));
+  const files = (await readdir(dir).catch(() => [])).sort();
+  const parts: string[] = [];
+  for (const f of files) {
+    if (!f.endsWith('.sql')) continue;
+    const text = await readIfExists(join(dir, f));
+    if (text !== null) parts.push(`### ${f}`, text);
+  }
+  return parts.length > 0 ? parts.join('\n') : null;
+}
+
+/** R4: заканчивается ли текст незакрытым fence (``` или ~~~). Такой журнал битый:
+ *  дописанный далее раздел (включая `# CRASH`) попал бы внутрь fence и не распарсился. */
+export function hasOpenFence(text: string): boolean {
+  let fenceChar: string | null = null;
+  let fenceLen = 0;
+  for (const line of text.split('\n')) {
+    if (fenceChar === null) {
+      const open = openFence(line);
+      if (open !== null) {
+        fenceChar = open.char;
+        fenceLen = open.len;
+      }
+    } else if (isClosingFence(line, fenceChar, fenceLen)) {
+      fenceChar = null;
+      fenceLen = 0;
+    }
+  }
+  return fenceChar !== null;
 }
 
 // Все OBJECT-объекты таска: живут ТОЛЬКО в issue-app.md (план), а НЕ в chat.md.
@@ -150,16 +223,20 @@ async function buildSystemPrompt(
   lines.push(specLines(spec));
   lines.push('');
   // SPEC-биндинги (доверенный конфиг владельца) — читаем как есть.
+  // R7: обязательный минимум контекста роли — fail-closed. Отсутствующий/нечитаемый
+  // файл не молча пропускается, а останавливает ход: иначе роль работает без
+  // контрактов безопасности/карты схемы, которые ей обязаны передать.
   for (const f of context) {
     const p = resolve(vaultRoot, f);
     const text = await readIfExists(p);
-    if (text !== null) {
-      lines.push(`Контекст из «${f}»:`);
-      lines.push('```');
-      lines.push(text);
-      lines.push('```');
-      lines.push('');
+    if (text === null) {
+      throw new Error(`SPEC context «${f}» не читается (${p}): обязательный минимум контекста роли ${role} недоступен`);
     }
+    lines.push(`Контекст из «${f}»:`);
+    lines.push('```');
+    lines.push(text);
+    lines.push('```');
+    lines.push('');
   }
   // fd-vault (пользовательский ввод из ISSUE) — не выпускаем за vaultRoot (path traversal, симлинки).
   const vaultReal = await realpath(vaultRoot).catch(() => null);
@@ -179,7 +256,7 @@ async function buildSystemPrompt(
     }
   }
   lines.push('Правила формата раздела (строго):');
-  lines.push('1. Заголовок L1: `# {РАЗДЕЛ} {N}` (с номером).');
+  lines.push('1. Заголовок L1: `# {РАЗДЕЛ} {N}` (с номером). НО если хост не сообщил тебе конкретный раздел и номер (свободный ход), пиши заголовок БЕЗ номера — `# {РАЗДЕЛ}`; корректный номер проставит хост.');
   lines.push('2. Свойства — ОДНОЙ строкой сразу под заголовком, в порядке `fd-from`, `fd-createdAt`, `fd-to`, `fd-reply`.');
   lines.push('3. После строки свойств — пустая строка, затем тело раздела.');
   lines.push('4. Тело — по существу, на русском.');
@@ -283,7 +360,10 @@ export function stampFixItem(
     const props = `[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]`;
     inner = `## ${l2}\n${props}\n\n${body.trim()}`;
   } else {
-    inner = stampRoleFields(body, role, now).trim();
+    // R10: L1-дуга без подзаголовка — полный ответ прямо в FIX-контейнер (с fd-reply),
+    // иначе входная дуга останется открытой и тот же FIX повторится следующим шагом.
+    const props = `[fd-from:: ${role}] [fd-createdAt:: ${nowStamp(now)}] [fd-to:: AI.REVIEWER] [fd-reply:: [[#${arcAddr}]]]`;
+    inner = `${props}\n\n${body.trim()}`;
   }
   return `${stampHeader('FIX', role, l1Number, [arcAddr], now)}${inner}`;
 }
@@ -391,6 +471,10 @@ export interface TFdPromptOpts {
   /** Детерминированный accept-статус дуги-ответа человека (`ANSWERS n#A m`):
    *  `true` — ответ ровно `+`; `false` — иной ответ. `undefined` — дуга не ответ человека. */
   acceptAnswer?: boolean;
+  /** R7: текст актуального post-change снимка БД — контекст для REVIEW. */
+  snapshotText?: string;
+  /** R9: адреса дуг, которые закрывает заголовок REVIEW (все, что ревьюер обязан проверить). */
+  reviewAddrs?: string[];
 }
 
 export function buildUserPrompt(
@@ -408,7 +492,7 @@ export function buildUserPrompt(
   lines.push('---');
   lines.push('');
   if (section === 'FIX' && opts?.fixMode !== 'item') {
-    lines.push(`Следующий ход: роль «${role}» отвечает на ВСЕ открытые замечания этого ревью сразу (одна секция на все), а не на одну дугу.`);
+    lines.push(`Следующий ход: роль «${role}» отвечает на ВСЕ открытые замечания ревью «${arcAddr.split('#')[0]}» сразу (одна секция на все замечания), а не на одну дугу.`);
   } else {
     lines.push(`Следующий ход: роль «${role}» отвечает на дугу «${arcAddr}».`);
   }
@@ -431,6 +515,16 @@ export function buildUserPrompt(
       }
     } else if (section === 'REVIEW') {
       lines.push(`Если нашёл замечания — под каждое вложенный «## BUG N»/«## RISK N»/«## OTHER N» (только новые, не повторяй уже закрытые) с телом и свойствами \`[fd-to:: AI.CODER.SENIOR] [fd-reply:: [[#${arcAddr}]]]\`. Поля fd-from/fd-createdAt НЕ пиши — их проставляет хост. Если замечаний нет — коротко «замечаний нет» без fd-to (дальше решает человек: DONE или новый ISSUE).`);
+      if (opts?.reviewAddrs !== undefined && opts.reviewAddrs.length > 1) {
+        lines.push(`Этот REVIEW закрывает несколько дуг к ревьюеру. Проверь ВСЕ входные объекты по этим дугам (${opts.reviewAddrs.map((a) => '«' + a + '»').join(', ')}) — замечания можно группировать, но ни одна дуга не должна остаться без вердикта.`);
+      }
+      if (opts?.snapshotText !== undefined && opts.snapshotText.trim() !== '') {
+        lines.push('');
+        lines.push('Актуальный снимок БД (post-change, после последних CODE/FIX) — ревьюируй именно его содержимое:');
+        lines.push('---');
+        lines.push(opts.snapshotText);
+        lines.push('---');
+      }
     }
   } else if (opts?.acceptAnswer !== undefined) {
     // Разбор ответа человека на вопрос (accept-политика канона): accept — только ровно `+`.
@@ -441,7 +535,7 @@ export function buildUserPrompt(
     }
     lines.push('Раздел и свойства fd-to/fd-reply (на дуги-ответы) пиши сам; поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   } else {
-    lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше). Пиши заголовок раздела и свойства fd-to/fd-reply (на дугу); поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
+    lines.push('Раздел выбери сам (ISSUE → QUESTIONS или передача ISSUE дальше). Пиши заголовок раздела БЕЗ номера (номер проставит хост) и свойства fd-to/fd-reply (на дугу); поля fd-from/fd-createdAt НЕ пиши — их проставляет хост.');
   }
   return lines.join('\n');
 }
@@ -645,6 +739,12 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     result.errors.push(...initialErrs.map((e) => `${e.relativeFileName}: ${e.error}`));
     return result;
   }
+  // R4: незакрытый fence в конце журнала — битое состояние: следующий раздел (включая
+  // `# CRASH`) попал бы внутрь fence и не распарсился. Стоп до агента.
+  if (hasOpenFence(journal)) {
+    result.errors.push('журнал заканчивается незакрытым fence — закрой его и перезапусти');
+    return result;
+  }
 
   for (let i = 0; i < maxSteps; i++) {
     const step = nextStep(content);
@@ -689,7 +789,13 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       break;
     }
     const gate = step.section === 'REVIEW' && gateDue(content, opts.spec);
-    const system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
+    let system: string;
+    try {
+      system = await buildSystemPrompt(role, brief.spec, brief.context, brief.vault, vaultRoot, gate, opts.mcp !== undefined ? connection : null);
+    } catch (e) {
+      result.errors.push(String((e as Error)?.message ?? e));
+      break;
+    }
     const l1Number = nextL1Number(content, step.section ?? 'ISSUE');
     const reference =
       step.section === 'FIX' && fixMode === 'item' && opts.spec.fixReference === true
@@ -702,10 +808,27 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
       step.section === null && roleCovers('AI.ANALYST', role)
         ? acceptOf(content, step.arc.addr)
         : null;
+    // R9: заголовок REVIEW закрывает только открытые дуги CODE/FIX, адресованные
+    // ТЕКУЩЕМУ исполнителю (roleCovers), а не всё семейство AI.REVIEWER — иначе сюда
+    // попали бы не-CODE/FIX дуги и дуги к другому экземпляру ревьюера, которые этот
+    // автор не закроет. R7: REVIEW дополнительно получает актуальный post-change снимок.
+    const reviewAddrs =
+      step.section === 'REVIEW'
+        ? openArcs(content)
+            .filter(
+              (a) =>
+                (a.addr.startsWith('CODE ') || a.addr.startsWith('FIX ')) &&
+                a.to.some((r) => roleCovers(role, r)),
+            )
+            .map((a) => a.addr)
+        : [step.arc.addr];
+    const snapshotText = step.section === 'REVIEW' ? await readLatestSnapshot(opts.taskDir) : undefined;
     const user = buildUserPrompt(role, journal, step.section, step.arc.addr, l1Number, {
       fixMode,
       fixReference: reference,
       acceptAnswer: acceptAnswer ?? undefined,
+      snapshotText: snapshotText ?? undefined,
+      reviewAddrs: step.section === 'REVIEW' ? reviewAddrs : undefined,
     });
     let tools: TFdMcpTool[] | undefined;
     try {
@@ -774,6 +897,28 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
               break;
             }
             await captureSnapshot(opts.taskDir, 'baseline', defs);
+          } else {
+            // R17: baseline уже снят — проверить его актуальность относительно плана.
+            // План мог измениться после снятия (объект удалён/добавлен/стал edit), а guard
+            // «до первого CODE» не переснимет: расхождение стопит, человек удаляет
+            // snapshots/baseline/ и перезапускает.
+            let manifest: { objects?: Array<{ objPath?: string }> };
+            try {
+              manifest = JSON.parse(baselineManifest) as { objects?: Array<{ objPath?: string }> };
+            } catch {
+              result.errors.push('baseline manifest.json не читается — удалите snapshots/baseline/ и перезапустите');
+              break;
+            }
+            const manifestPaths = new Set((manifest.objects ?? []).map((o) => o.objPath).filter((p) => p !== undefined && p.trim() !== '') as string[]);
+            const planPaths = new Set(plan.map((o) => o.objPath));
+            const stale = [...manifestPaths].filter((p) => !planPaths.has(p));
+            const missing = plan.filter((o) => o.objAction === 'edit' && !manifestPaths.has(o.objPath)).map((o) => o.objPath);
+            if (stale.length > 0 || missing.length > 0) {
+              result.errors.push(
+                `baseline устарел относительно плана (в baseline, но не в плане: ${stale.join(', ') || '—'}; edit без baseline: ${missing.join(', ') || '—'}) — удалите snapshots/baseline/ и перезапустите`,
+              );
+              break;
+            }
           }
         }
       }
@@ -814,15 +959,8 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // ставит L1 сам, `# ISSUE 7` в теле модели не должен стать топиком. Null-кейс модель
     // пишет L1 сама — не трогаем.
     const sanitized = step.section !== null ? stripL1Headers(sectionText) : numberL1Headers(sectionText, content);
-    // Претензия 1: REVIEW закрывает ВСЕ открытые дуги к AI.REVIEWER одним разделом
-    // (список fd-reply) — иначе item-FIX (N разделов) порождает N микро-REVIEW,
-    // reviewFixIterations считает каждый за итерацию и гейт срабатывает раньше порога.
-    const reviewAddrs =
-      step.section === 'REVIEW'
-        ? openArcs(content)
-            .filter((a) => a.to.some((r) => roleCovers('AI.REVIEWER', r)))
-            .map((a) => a.addr)
-        : [step.arc.addr];
+    // reviewAddrs вычислен выше (до промпта, R9): REVIEW закрывает все совместимые
+    // открытые дуги CODE/FIX к текущему ревьюеру одним разделом (список fd-reply).
     let entry: string;
     if (step.section === 'FIX' && fixMode === 'item') {
       entry = stampFixItem(sanitized.trim(), role, l1Number, step.arc.addr, now);
@@ -844,6 +982,22 @@ export async function run(opts: TFdRunOptions): Promise<TFdRunResult> {
     // (override), журнал на диске ещё не тронут. Битый раздел в журнал не попадает.
     content = textToStructure(candidate, true);
     let errs: Array<{ relativeFileName: string; error: string }> = [];
+    // R4: свободный ход обязан дать РОВНО один новый L1 допустимого типа (ISSUE/QUESTIONS)
+    // и закрыть входную дугу — иначе ход засчитан без нового раздела/прогресса и та же
+    // дуга вернётся следующим шагом. `steps++` считает состоявшийся переход, не структуру.
+    if (step.section === null) {
+      const before = level1List(textToStructure(journal, true));
+      const after = level1List(content);
+      const added = after.filter((l) => !before.some((b) => b.title === l.title && b.idx === l.idx));
+      if (added.length !== 1) {
+        errs.push({ relativeFileName: CHAT_FILE, error: `свободный ход: ожидался ровно один новый L1-раздел, получено ${added.length}` });
+      } else if (added[0].title !== 'ISSUE' && added[0].title !== 'QUESTIONS') {
+        errs.push({ relativeFileName: CHAT_FILE, error: `свободный ход: недопустимый тип раздела «${added[0].title}» (допустимы ISSUE, QUESTIONS)` });
+      }
+      if (openArcs(content).some((a) => a.addr === step.arc.addr)) {
+        errs.push({ relativeFileName: CHAT_FILE, error: `свободный ход: раздел не закрыл входную дугу ${step.arc.addr}` });
+      }
+    }
     // C3: тело CODE и item-FIX не должно содержать заголовков — их проставляет хост,
     // L2/L3 из прозы модели стали бы подтопиками и подделали маршрут дуг.
     if ((step.section === 'CODE' || (step.section === 'FIX' && fixMode === 'item')) && hasHeadings(sanitized)) {
